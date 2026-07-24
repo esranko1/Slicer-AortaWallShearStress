@@ -22,14 +22,14 @@ def main():
 
     # --- All patient identifiers ---------------------------------------------
     # Must exactly match the values you used for `c` in 1.3.convert_mat_to_npz.py.
-    all_ids = None  # TODO: e.g. np.array([str(i) for i in range(100)])
+    all_ids = np.array([str(i) for i in range(100)])
 
     # --- Decide which patients go to train vs. valid -------------------------
     # Reuse your existing patient-grouping logic here (the one that avoids
     # putting the same patient in both train and validation) rather than a
     # plain random split.
-    train_ids = None  # TODO
-    valid_ids = None  # TODO
+    train_ids = all_ids[:80]  
+    valid_ids = all_ids[80:]
 
     print("Split sizes (check before saving):")
     print("  train:", None if train_ids is None else len(train_ids))
@@ -37,8 +37,8 @@ def main():
 
     # --- Save ------------------------------------------------------------------
     # Uncomment once train_ids/valid_ids are filled in.
-    # np.savez_compressed(OUTPUT_PATH, train=train_ids, valid=valid_ids)
-    # print(f"\nSaved to {OUTPUT_PATH}")
+    np.savez_compressed(OUTPUT_PATH, train=train_ids, valid=valid_ids)
+    print(f"\nSaved to {OUTPUT_PATH}")
 
 
 if __name__ == "__main__":
