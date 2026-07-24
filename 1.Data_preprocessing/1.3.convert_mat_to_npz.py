@@ -36,6 +36,22 @@ def main():
     print("  Z:", Z.shape)
     print("  SWSS:", SWSS.shape)
 
+    # --- Step 1.5: center each patient's point cloud on its own centroid ----
+    # Patients' raw coordinates are not co-registered to a common frame (confirmed
+    # empirically — the same grid index landed in wildly different absolute
+    # positions across patients, e.g. Z-coordinate split into two clusters ~70-80mm
+    # apart). Centering removes that translation inconsistency before the model
+    # ever sees it.
+    X_centroids_before = X.mean(axis=1)
+    print("\nCentroids before centering (first 5 patients):")
+    print(X_centroids_before[:5])
+
+    X = X - X.mean(axis=1, keepdims=True)
+
+    X_centroids_after = X.mean(axis=1)
+    print("\nCentroids after centering (first 5 patients, should be ~0,0,0):")
+    print(X_centroids_after[:5])
+
     # --- Step 2: broadcast Z across all 4096 points -------------------------
     # Z is (100, 50) — one waveform per patient.
     # You need Z_broadcast with shape (100, 4096, 50), where
