@@ -8,6 +8,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 import random
 from functools import partial
@@ -473,6 +474,29 @@ class DeepONetCartesianProd(dde.maps.NN, nn.Module):
                 [self.b])
 
 
+def compute_ssim(pred, target, data_range=2.0, window_size=3):
+    """Lightweight single-scale SSIM (average-pooling window, no Gaussian weighting),
+    matching the simplicity of the original filter_size=3 tf.image.ssim call this
+    replaces. pred/target: (batch, 1, H, W)."""
+    C1 = (0.01 * data_range) ** 2
+    C2 = (0.03 * data_range) ** 2
+    pad = window_size // 2
+
+    mu_pred = F.avg_pool2d(pred, window_size, stride=1, padding=pad)
+    mu_target = F.avg_pool2d(target, window_size, stride=1, padding=pad)
+    mu_pred_sq = mu_pred ** 2
+    mu_target_sq = mu_target ** 2
+    mu_pred_target = mu_pred * mu_target
+
+    sigma_pred_sq = F.avg_pool2d(pred * pred, window_size, stride=1, padding=pad) - mu_pred_sq
+    sigma_target_sq = F.avg_pool2d(target * target, window_size, stride=1, padding=pad) - mu_target_sq
+    sigma_pred_target = F.avg_pool2d(pred * target, window_size, stride=1, padding=pad) - mu_pred_target
+
+    ssim_map = ((2 * mu_pred_target + C1) * (2 * sigma_pred_target + C2)) / \
+               ((mu_pred_sq + mu_target_sq + C1) * (sigma_pred_sq + sigma_target_sq + C2))
+    return ssim_map.mean()
+
+
 def define_model(args, device, data, output_scalers):
     branch_condition_input_dim = data.train_x[0].shape[1] 
     pointnet_input_dim = data.train_x[1].shape[-1] 
@@ -497,7 +521,20 @@ def define_model(args, device, data, output_scalers):
     def loss_func(outputs, targets):
         if outputs.dim() == targets.dim() + 1 and outputs.shape[-1] == 1:
             targets = targets.unsqueeze(-1)
-        return torch.mean((outputs - targets) ** 2)
+
+        # SSIM-aware loss, matching the PI's original SSIMLoss (2*MAE + 1 - SSIM),
+        # reshaping the flat 4096-point WSS values back into the 32x128
+        # circumferential x longitudinal grid so SSIM sees real spatial structure.
+        # Targets were MinMax-scaled to [-1, 1], hence data_range=2.0.
+        batch_size = outputs.shape[0]
+        outputs_flat = outputs.squeeze(-1) if outputs.dim() == 3 else outputs
+        targets_flat = targets.squeeze(-1) if targets.dim() == 3 else targets
+        outputs_grid = outputs_flat.reshape(batch_size, 1, 32, 128)
+        targets_grid = targets_flat.reshape(batch_size, 1, 32, 128)
+
+        mae = torch.mean(torch.abs(outputs_flat - targets_flat))
+        ssim_val = compute_ssim(outputs_grid, targets_grid, data_range=2.0)
+        return 2 * mae + 1 - ssim_val
     
     def err_MAE(true_vals, pred_vals):
         return np.mean(np.abs(true_vals - pred_vals), axis=1)

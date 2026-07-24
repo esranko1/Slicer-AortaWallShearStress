@@ -25,11 +25,16 @@ def main():
     all_ids = np.array([str(i) for i in range(100)])
 
     # --- Decide which patients go to train vs. valid -------------------------
-    # Reuse your existing patient-grouping logic here (the one that avoids
-    # putting the same patient in both train and validation) rather than a
-    # plain random split.
-    train_ids = all_ids[:80]  
-    valid_ids = all_ids[80:]
+    # Randomized (not a plain positional slice), with a fixed seed so the split
+    # is reproducible across runs. Note: this is a random split, not the more
+    # sophisticated patient-grouping logic used elsewhere in the lab's pipeline
+    # (which avoids splitting related scans of the same real patient across
+    # train/valid) — these IDs are just synthetic 0..99 indices, so grouping
+    # logic doesn't have real patient-relationship info to act on here.
+    rng = np.random.default_rng(seed=2024)
+    shuffled_ids = rng.permutation(all_ids)
+    train_ids = shuffled_ids[:80]
+    valid_ids = shuffled_ids[80:]
 
     print("Split sizes (check before saving):")
     print("  train:", None if train_ids is None else len(train_ids))
