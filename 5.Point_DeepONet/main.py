@@ -617,7 +617,7 @@ def train_model(model, scheduler, optimizer, args, output_scalers, experiment_di
     )
     total_training_time = time.time() - start_time
 
-    scheduler.step(losshistory.loss_test[-1])
+    scheduler.step(np.array(losshistory.loss_test[-1]).item())
     torch.save(model.net.state_dict(), f'{experiment_dir}/model_final.pth')
     
     total_params = sum(p.numel() for p in model.net.parameters() if p.requires_grad)
