@@ -602,10 +602,16 @@ def define_model(args, device, data, output_scalers):
     return model, scheduler, optimizer
 
 def train_model(model, scheduler, optimizer, args, output_scalers, experiment_dir, device):
-    callbacks = []
+    # Early stopping on test loss, same idea as the PI's original EarlyStopping(patience=50)
+    # callback, adapted to this training loop's display_every=100 cadence (callbacks fire
+    # once per display_every iterations, so patience=5 here means ~500 iterations of no
+    # improvement before stopping).
+    callbacks = [
+        dde.callbacks.EarlyStopping(monitor="loss_test", patience=5, min_delta=1e-5),
+    ]
     torch.autograd.set_detect_anomaly(True)
-    logging.info(f'y_train.shape = {model.data.train_y.shape}')  
-    logging.info(f'y_test.shape = {model.data.test_y.shape}')    
+    logging.info(f'y_train.shape = {model.data.train_y.shape}')
+    logging.info(f'y_test.shape = {model.data.test_y.shape}')
 
     start_time = time.time()
     losshistory, train_state = model.train(
@@ -616,6 +622,15 @@ def train_model(model, scheduler, optimizer, args, output_scalers, experiment_di
         callbacks=callbacks
     )
     total_training_time = time.time() - start_time
+
+    # Explicitly restore the best-test-loss checkpoint rather than trusting that the
+    # model's in-memory weights are already the best ones after training stops.
+    best_checkpoint = f"{experiment_dir}/model_checkpoint.pth-{train_state.best_step}.pt"
+    if os.path.exists(best_checkpoint):
+        model.restore(best_checkpoint, verbose=1)
+        logging.info(f"Restored best checkpoint from step {train_state.best_step}")
+    else:
+        logging.warning(f"Best checkpoint not found at {best_checkpoint}; using final-step weights")
 
     scheduler.step(np.array(losshistory.loss_test[-1]).item())
     torch.save(model.net.state_dict(), f'{experiment_dir}/model_final.pth')
