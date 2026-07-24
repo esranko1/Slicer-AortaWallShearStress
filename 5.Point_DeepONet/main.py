@@ -587,7 +587,7 @@ def define_model(args, device, data, output_scalers):
         metrics = []
 
     optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=1e-5)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=500, verbose=True)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=500)
 
     model = dde.Model(data, model)
     model.compile(
