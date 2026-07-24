@@ -495,6 +495,8 @@ def define_model(args, device, data, output_scalers):
     ).to(device)
 
     def loss_func(outputs, targets):
+        if outputs.dim() == targets.dim() + 1 and outputs.shape[-1] == 1:
+            targets = targets.unsqueeze(-1)
         return torch.mean((outputs - targets) ** 2)
     
     def err_MAE(true_vals, pred_vals):
@@ -699,8 +701,11 @@ def main():
 
     # Simple single-output (WSS) evaluation, replacing the original bracket-specific
     # (ux/uy/uz/von-Mises, direction-grouped, VTK-exporting) evaluation block.
-    test_outputs_np = to_numpy(test_outputs)[..., np.newaxis]
-    test_targets_np = to_numpy(test_targets)[..., np.newaxis]
+    def ensure_3d(arr):
+        return arr[..., np.newaxis] if arr.ndim == 2 else arr
+
+    test_outputs_np = ensure_3d(to_numpy(test_outputs))
+    test_targets_np = ensure_3d(to_numpy(test_targets))
     test_outputs_inv = inv(test_outputs_np, output_scalers).squeeze(-1)
     test_targets_inv = inv(test_targets_np, output_scalers).squeeze(-1)
 
