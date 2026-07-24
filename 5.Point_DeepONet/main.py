@@ -602,12 +602,13 @@ def define_model(args, device, data, output_scalers):
     return model, scheduler, optimizer
 
 def train_model(model, scheduler, optimizer, args, output_scalers, experiment_dir, device):
-    # Early stopping on test loss, same idea as the PI's original EarlyStopping(patience=50)
-    # callback, adapted to this training loop's display_every=100 cadence (callbacks fire
-    # once per display_every iterations, so patience=5 here means ~500 iterations of no
-    # improvement before stopping).
+    # Early stopping on test loss. Note: DeepXDE's callback patience is counted in raw
+    # training iterations, not in display_every=100 checkpoints (patience=5 stopped
+    # training after only 6 iterations in practice) — set high enough to give the model
+    # real runway, since your data needed ~100 iterations just to see its first
+    # meaningful improvement.
     callbacks = [
-        dde.callbacks.EarlyStopping(monitor="loss_test", patience=5, min_delta=1e-5),
+        dde.callbacks.EarlyStopping(monitor="loss_test", patience=500, min_delta=1e-5),
     ]
     torch.autograd.set_detect_anomaly(True)
     logging.info(f'y_train.shape = {model.data.train_y.shape}')
