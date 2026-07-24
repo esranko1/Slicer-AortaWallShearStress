@@ -116,10 +116,12 @@ def process_branch_condition_input(input_components, tmp):
     input_mapping = {'v': list(range(3, 53))}
     selected_indices = []
     for comp in input_components:
-        if comp == 'c':
-            selected_indices.extend(input_mapping[comp])
-        elif comp in input_mapping:
-            selected_indices.append(input_mapping[comp])
+        if comp in input_mapping:
+            value = input_mapping[comp]
+            if isinstance(value, list):
+                selected_indices.extend(value)
+            else:
+                selected_indices.append(value)
     branch_condition_input = tmp['a'][:, 0, selected_indices].astype(np.float32)
     return branch_condition_input
 
