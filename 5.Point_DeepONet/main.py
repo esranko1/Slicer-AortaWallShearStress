@@ -238,9 +238,9 @@ def load_and_preprocess_data(args, dir_base_save_model):
     pickle.dump(output_scalers, open(f'{dir_base_save_model}/output_scaler.pkl', 'wb'))
     
     if args.split_method == 'random':
-        split_file = f'../data/npy/combined_{args.N_samples}_split_random_train_valid.npz'
+        split_file = f'../Data/combined_{args.N_samples}_split_random_train_valid.npz'
     else:
-        split_file = f'../data/npy/combined_{args.N_samples}_split_mass_train_valid.npz'
+        split_file = f'../Data/combined_{args.N_samples}_split_mass_train_valid.npz'
     split_data = np.load(split_file)
     train_case = map_keys_to_indices(split_data['train'], np.array([key for key in tmp['c']]))
     test_case = map_keys_to_indices(split_data['valid'], np.array([key for key in tmp['c']]))
