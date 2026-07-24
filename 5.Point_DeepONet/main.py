@@ -354,8 +354,8 @@ class DeepONetCartesianProd(dde.maps.NN, nn.Module):
             nn.Conv1d(32, 64, 1),
             nn.BatchNorm1d(64),
             self.activation,
-            nn.Conv1d(64, 100, 1),
-            nn.BatchNorm1d(100),
+            nn.Conv1d(64, branch_hidden_dim, 1),
+            nn.BatchNorm1d(branch_hidden_dim),
             self.activation,
         )
 
