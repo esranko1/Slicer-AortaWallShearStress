@@ -602,14 +602,12 @@ def define_model(args, device, data, output_scalers):
     return model, scheduler, optimizer
 
 def train_model(model, scheduler, optimizer, args, output_scalers, experiment_dir, device):
-    # Early stopping on test loss. Note: DeepXDE's callback patience is counted in raw
-    # training iterations, not in display_every=100 checkpoints (patience=5 stopped
-    # training after only 6 iterations in practice) — set high enough to give the model
-    # real runway, since your data needed ~100 iterations just to see its first
-    # meaningful improvement.
-    callbacks = [
-        dde.callbacks.EarlyStopping(monitor="loss_test", patience=500, min_delta=1e-5),
-    ]
+    # DeepXDE's built-in early-stopping/best-checkpoint tracking appears unreliable on
+    # this setup (it selected a checkpoint with worse test loss than what its own
+    # printed table showed as the actual minimum). Disabled for now — using a fixed
+    # iteration count and evaluating the model's final weights directly instead, which
+    # is what produced the good result at N_iterations=100.
+    callbacks = []
     torch.autograd.set_detect_anomaly(True)
     logging.info(f'y_train.shape = {model.data.train_y.shape}')
     logging.info(f'y_test.shape = {model.data.test_y.shape}')
@@ -623,15 +621,6 @@ def train_model(model, scheduler, optimizer, args, output_scalers, experiment_di
         callbacks=callbacks
     )
     total_training_time = time.time() - start_time
-
-    # Explicitly restore the best-test-loss checkpoint rather than trusting that the
-    # model's in-memory weights are already the best ones after training stops.
-    best_checkpoint = f"{experiment_dir}/model_checkpoint.pth-{train_state.best_step}.pt"
-    if os.path.exists(best_checkpoint):
-        model.restore(best_checkpoint, verbose=1)
-        logging.info(f"Restored best checkpoint from step {train_state.best_step}")
-    else:
-        logging.warning(f"Best checkpoint not found at {best_checkpoint}; using final-step weights")
 
     scheduler.step(np.array(losshistory.loss_test[-1]).item())
     torch.save(model.net.state_dict(), f'{experiment_dir}/model_final.pth')
