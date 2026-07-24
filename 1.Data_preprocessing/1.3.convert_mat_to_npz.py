@@ -7,18 +7,14 @@ Target shapes:
                             waveform broadcast identically across all 4096 points per patient
     b -> (100, 4096, 1)   : SWSS
     c -> (100,)           : patient identifiers
-
-Fill in each TODO below. Run this script from inside 1.Data_preprocessing/.
 """
 
 import os
 import numpy as np
 from scipy.io import loadmat
 
-# --- Path to your .mat file -------------------------------------------------
-# TODO: point this at wherever your .mat file actually lives on disk.
-# Keep this OUTSIDE the git repo if it isn't already (this repo is public).
-MAT_FILE_PATH = "/path/to/your/dataForPy9.mat"
+
+MAT_FILE_PATH = "C:\\Users\\esranko1\\Desktop\\WSS_project\\dataForPy9.mat"
 
 # --- Where the converted file gets saved ------------------------------------
 # This matches the existing Data/Sampled folder already in this repo.
@@ -45,21 +41,21 @@ def main():
     # You need Z_broadcast with shape (100, 4096, 50), where
     # Z_broadcast[i, j, :] == Z[i, :] for every j (0..4095).
     # Hint: insert a new axis of size 1, then np.repeat along that axis.
-    Z_broadcast = None  # TODO: replace this line
+    Z_broadcast = np.repeat(Z[:, np.newaxis, :], 4096, axis=1)
 
     # --- Step 3: concatenate X and Z_broadcast into `a` ---------------------
     # Result should be shape (100, 4096, 53): columns 0-2 = xyz, columns 3-52 = velocity.
     # Hint: np.concatenate(..., axis=-1)
-    a = None  # TODO: replace this line
+    a = np.concatenate([X, Z_broadcast], axis=-1)
 
     # --- Step 4: reshape SWSS into `b` --------------------------------------
     # (100, 4096) -> (100, 4096, 1)
-    b = None  # TODO: replace this line
+    b = SWSS[:, :, np.newaxis]
 
     # --- Step 5: build patient identifiers `c` ------------------------------
     # Simplest option: np.array([str(i) for i in range(100)])
     # Or reuse your existing patient ID / sno array if you want real IDs.
-    c = None  # TODO: replace this line
+    c = np.array([str(i) for i in range(100)])
 
     # --- Sanity checks before saving ----------------------------------------
     print("\nFinal shapes (check these before saving):")
@@ -68,9 +64,8 @@ def main():
     print("  c:", None if c is None else c.shape, "-> expected (100,)")
 
     # --- Step 6: save --------------------------------------------------------
-    # Uncomment once a, b, c are all filled in and shapes look right.
-    # np.savez_compressed(OUTPUT_PATH, a=a, b=b, c=c)
-    # print(f"\nSaved to {OUTPUT_PATH}")
+    np.savez_compressed(OUTPUT_PATH, a=a, b=b, c=c)
+    print(f"\nSaved to {OUTPUT_PATH}")
 
 
 if __name__ == "__main__":
