@@ -1,0 +1,9 @@
+Data/*
+experiments/*
+figures/*
+!Data/.gitkeep
+!experiments/.gitkeep
+!figures/.gitkeep
+
+# OS files
+.DS_Store

@@ -1,0 +1,77 @@
+"""
+Converts the lab's .mat file into the a/b/c .npz format that
+5.Point_DeepONet/main.py expects to load.
+
+Target shapes:
+    a -> (100, 4096, 53)  : xyz (3 cols) + inlet velocity waveform (50 cols),
+                            waveform broadcast identically across all 4096 points per patient
+    b -> (100, 4096, 1)   : SWSS
+    c -> (100,)           : patient identifiers
+
+Fill in each TODO below. Run this script from inside 1.Data_preprocessing/.
+"""
+
+import os
+import numpy as np
+from scipy.io import loadmat
+
+# --- Path to your .mat file -------------------------------------------------
+# TODO: point this at wherever your .mat file actually lives on disk.
+# Keep this OUTSIDE the git repo if it isn't already (this repo is public).
+MAT_FILE_PATH = "/path/to/your/dataForPy9.mat"
+
+# --- Where the converted file gets saved ------------------------------------
+# This matches the existing Data/Sampled folder already in this repo.
+OUTPUT_DIR = os.path.join("..", "Data", "Sampled")
+OUTPUT_PATH = os.path.join(OUTPUT_DIR, "Rpt0_N4096.npz")
+
+
+def main():
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+    # --- Step 1: load the .mat file -----------------------------------------
+    mat = loadmat(MAT_FILE_PATH)
+    X = mat["X"]          # shape (100, 4096, 3)
+    Z = mat["Z"]          # shape (100, 50)
+    SWSS = mat["SWSS"]    # shape (100, 4096)
+
+    print("Loaded shapes:")
+    print("  X:", X.shape)
+    print("  Z:", Z.shape)
+    print("  SWSS:", SWSS.shape)
+
+    # --- Step 2: broadcast Z across all 4096 points -------------------------
+    # Z is (100, 50) — one waveform per patient.
+    # You need Z_broadcast with shape (100, 4096, 50), where
+    # Z_broadcast[i, j, :] == Z[i, :] for every j (0..4095).
+    # Hint: insert a new axis of size 1, then np.repeat along that axis.
+    Z_broadcast = None  # TODO: replace this line
+
+    # --- Step 3: concatenate X and Z_broadcast into `a` ---------------------
+    # Result should be shape (100, 4096, 53): columns 0-2 = xyz, columns 3-52 = velocity.
+    # Hint: np.concatenate(..., axis=-1)
+    a = None  # TODO: replace this line
+
+    # --- Step 4: reshape SWSS into `b` --------------------------------------
+    # (100, 4096) -> (100, 4096, 1)
+    b = None  # TODO: replace this line
+
+    # --- Step 5: build patient identifiers `c` ------------------------------
+    # Simplest option: np.array([str(i) for i in range(100)])
+    # Or reuse your existing patient ID / sno array if you want real IDs.
+    c = None  # TODO: replace this line
+
+    # --- Sanity checks before saving ----------------------------------------
+    print("\nFinal shapes (check these before saving):")
+    print("  a:", None if a is None else a.shape, "-> expected (100, 4096, 53)")
+    print("  b:", None if b is None else b.shape, "-> expected (100, 4096, 1)")
+    print("  c:", None if c is None else c.shape, "-> expected (100,)")
+
+    # --- Step 6: save --------------------------------------------------------
+    # Uncomment once a, b, c are all filled in and shapes look right.
+    # np.savez_compressed(OUTPUT_PATH, a=a, b=b, c=c)
+    # print(f"\nSaved to {OUTPUT_PATH}")
+
+
+if __name__ == "__main__":
+    main()

@@ -113,7 +113,7 @@ def log_parameters(args, device, name):
     logging.info(f'Fully Connected Hidden Dimension: {args.fc_hidden_dim}\n\n')
 
 def process_branch_condition_input(input_components, tmp):
-    input_mapping = {'m': 4, 'l': 5, 'c': [6, 7, 8]}
+    input_mapping = {'v': list(range(3, 53))}
     selected_indices = []
     for comp in input_components:
         if comp == 'c':
@@ -146,21 +146,9 @@ def process_trunk_input(input_components, tmp):
     return trunk_input
 
 def process_output(output_components, output_vals, identifiers):
-    output_mapping = {'x': 0, 'y': 1, 'z': 2, 's': 3}
+    output_mapping = {'w': 0}
     selected_indices = [output_mapping[comp] for comp in output_components]
     combined_output = output_vals[:, :, selected_indices]
-
-    unique_directions = set(id.split('_')[0] for id in identifiers)
-    clipping_ranges_dict = {direction: get_clipping_ranges_for_direction(direction) for direction in unique_directions}
-
-    for direction, clipping_ranges in clipping_ranges_dict.items():
-        indices = [i for i, id in enumerate(identifiers) if id.split('_')[0] == direction]
-        if not indices:
-            continue
-        indices = np.array(indices)
-        for j, idx in enumerate(selected_indices):
-            min_val, max_val = clipping_ranges[idx]
-            combined_output[indices, :, j] = np.clip(combined_output[indices, :, j], min_val, max_val)
 
     if combined_output.shape[-1] == 1:
         combined_output = combined_output.squeeze(-1)
@@ -487,8 +475,8 @@ def define_model(args, device, data, output_scalers):
     branch_condition_input_dim = data.train_x[0].shape[1] 
     pointnet_input_dim = data.train_x[1].shape[-1] 
     num_points = args.N_pt  
-    trunk_input_dim = data.train_x[2].shape[-1]  
-    num_output_components = 4
+    trunk_input_dim = data.train_x[2].shape[-1]
+    num_output_components = 1
     
     model = DeepONetCartesianProd(
         branch_condition_input_dim=branch_condition_input_dim,
@@ -691,7 +679,7 @@ def main():
     plot_loss_curves(losshistory, experiment_dir)
     
     test_outputs = model.predict(model.data.test_x)
-    test_targets = model.data.test_y  
+    test_targets = model.data.test_y
 
     def to_numpy(data):
         if isinstance(data, torch.Tensor):
@@ -707,179 +695,21 @@ def main():
         data_inv = scaler.inverse_transform(data_flat)
         return data_inv.reshape(data_shape)
 
-    test_outputs_inv = inv(test_outputs, output_scalers)
-    test_targets_inv = inv(test_targets, output_scalers)
-    components = ['ux', 'uy', 'uz', 'vm']
-    directions = [tcf.split('_')[0] for tcf in test_case_file]
-    unique_directions = list(set(directions))
+    # Simple single-output (WSS) evaluation, replacing the original bracket-specific
+    # (ux/uy/uz/von-Mises, direction-grouped, VTK-exporting) evaluation block.
+    test_outputs_np = to_numpy(test_outputs)[..., np.newaxis]
+    test_targets_np = to_numpy(test_targets)[..., np.newaxis]
+    test_outputs_inv = inv(test_outputs_np, output_scalers).squeeze(-1)
+    test_targets_inv = inv(test_targets_np, output_scalers).squeeze(-1)
 
-    subset_metrics_all_dir = os.path.join(experiment_dir, 'subset_metrics_all')
-    os.makedirs(subset_metrics_all_dir, exist_ok=True)
-    subset_plots_dir = os.path.join(experiment_dir, 'subset_plots')
-    os.makedirs(subset_plots_dir, exist_ok=True)
+    mae = np.mean(np.abs(test_outputs_inv - test_targets_inv))
+    rmse = np.sqrt(np.mean((test_outputs_inv - test_targets_inv) ** 2))
+    r2 = calculate_r2(test_targets_inv.flatten(), test_outputs_inv.flatten())
+    logging.info(f"Test WSS MAE: {mae:.4f}")
+    logging.info(f"Test WSS RMSE: {rmse:.4f}")
+    logging.info(f"Test WSS R2: {r2:.4f}")
 
-    for direction in unique_directions:
-        indices = [i for i, dir_label in enumerate(directions) if dir_label == direction]
-        if not indices:
-            logging.warning(f"No test samples found for direction: {direction}")
-            continue
-        true_vals_dir = test_targets_inv[indices, :, :]
-        pred_vals_dir = test_outputs_inv[indices, :, :]
-        for i, comp in enumerate(components):
-            true_comp = true_vals_dir[:, :, i].flatten()
-            pred_comp = pred_vals_dir[:, :, i].flatten()
-            mae = np.mean(np.abs(pred_comp - true_comp))
-            rmse = np.sqrt(np.mean((pred_comp - true_comp) ** 2))
-            r2 = calculate_r2(true_comp, pred_comp)
-            with open(os.path.join(subset_metrics_all_dir, f'{direction}_{comp}_MAE.txt'), 'w') as f_mae:
-                f_mae.write(f"{mae}")
-            with open(os.path.join(subset_metrics_all_dir, f'{direction}_{comp}_RMSE.txt'), 'w') as f_rmse:
-                f_rmse.write(f"{rmse}")
-            with open(os.path.join(subset_metrics_all_dir, f'{direction}_{comp}_R2.txt'), 'w') as f_r2:
-                f_r2.write(f"{r2:.3f}")
-            logging.info(f"subset Metrics for {direction} {comp}: MAE={mae:.4f}, RMSE={rmse:.4f}, R짼={r2:.4f}")
-            plot_r2_scatter(true_comp, pred_comp, comp, f'test_{direction}_{comp}', subset_plots_dir)
-
-    overall_metrics_all_dir = os.path.join(experiment_dir, 'overall_metrics_all')
-    os.makedirs(overall_metrics_all_dir, exist_ok=True)
-    overall_metrics_each_dir = os.path.join(experiment_dir, 'overall_metrics_each')
-    os.makedirs(overall_metrics_each_dir, exist_ok=True)
-    overall_plots_dir = os.path.join(experiment_dir, 'overall_plots')
-    os.makedirs(overall_plots_dir, exist_ok=True)
-
-    base = '/root/Example3/data/npy/'
-    targets_full = np.load(base + 'targets.npz', allow_pickle=True)
-    xyzd_full = np.load(base + 'xyzdmlc.npz', allow_pickle=True)
-
-    branch_scaler = pickle.load(open(f'{experiment_dir}/branch_scaler.pkl', 'rb'))
-    pointnet_scaler = pickle.load(open(f'{experiment_dir}/pointnet_scaler.pkl', 'rb'))
-    trunk_scaler = pickle.load(open(f'{experiment_dir}/trunk_scaler.pkl', 'rb'))
-    output_scalers = pickle.load(open(f'{experiment_dir}/output_scaler.pkl', 'rb'))
-
-    overall_vtk_dir = os.path.join(experiment_dir, 'overall_vtks')
-    os.makedirs(overall_vtk_dir, exist_ok=True)
-
-    directions = [tcf.split('_')[0] if '_' in tcf else 'unknown' for tcf in test_case_file]
-    unique_directions = list(set(directions))
-    components = ['ux', 'uy', 'uz', 'vm']
-    direction_metrics = {direction: {} for direction in directions}
-    all_metrics = {direction: {comp: {'true': [], 'pred': []} for comp in components} for direction in unique_directions}
-
-    for idx, tcf in tqdm(enumerate(test_case_file), total=len(test_case_file), desc="Processing Test Cases"):
-        branch_condition = xyzd_full[tcf][0, 4:9]
-        branch_pointnet = xyzd_full[tcf][:, :3]
-        trunk_input = xyzd_full[tcf][:, :4]
-        outputs = targets_full[tcf]
-
-        total_points = branch_pointnet.shape[0]
-        sampled_indices = np.random.choice(total_points, 5000, replace=False)
-        branch_pointnet_sampled = branch_pointnet[sampled_indices]
-
-        branch_condition_scaled = branch_scaler.transform(branch_condition[np.newaxis, :])
-        branch_pointnet_scaled = pointnet_scaler.transform(branch_pointnet_sampled)
-        branch_pointnet_scaled = branch_pointnet_scaled[np.newaxis, :, :]
-        trunk_input_scaled = trunk_scaler.transform(trunk_input)
-        trunk_input_scaled = trunk_input_scaled[np.newaxis, :, :]
-
-        x_test_sample = (
-            branch_condition_scaled,
-            branch_pointnet_scaled,
-            trunk_input_scaled
-        )
-        
-        y_pred = model.predict(x_test_sample)
-        u_pred = inv(y_pred, output_scalers)
-        u_pred = u_pred.squeeze(0)
-
-        direction = directions[idx]
-        clipping_ranges_gt = get_clipping_ranges_for_direction(direction)
-        for i in range(outputs.shape[1]):
-            min_val, max_val = clipping_ranges_gt.get(i, (-np.inf, np.inf))
-            outputs[:, i] = np.clip(outputs[:, i], min_val, max_val)
-
-        if '_' in tcf:
-            filename = tcf.split('_', 1)[1]
-        else:
-            filename = tcf
-
-        if filename not in direction_metrics[direction]:
-            direction_metrics[direction][filename] = {}
-
-        for i, comp in enumerate(components):
-            mae = np.mean(np.abs(u_pred[:, i] - outputs[:, i]))
-            rmse = np.sqrt(np.mean((u_pred[:, i] - outputs[:, i]) ** 2))
-            r2 = calculate_r2(outputs[:, i], u_pred[:, i])
-            direction_metrics[direction][filename][comp] = {
-                'mae': mae,
-                'rmse': rmse,
-                'r2': r2
-            }
-        
-        for i, comp in enumerate(components):
-            all_metrics[direction][comp]['true'].extend(outputs[:, i])
-            all_metrics[direction][comp]['pred'].extend(u_pred[:, i])
-
-        vtk_filepath = f'/root/Example3/data/VolumeMesh/{filename}.vtk'
-
-        if os.path.exists(vtk_filepath):
-            try:
-                vtk_obj = pv.read(vtk_filepath)
-                new_rows = np.zeros((5, outputs.shape[1]))
-                outputs = np.vstack([outputs, new_rows])
-                u_pred = np.vstack([u_pred, new_rows])
-                vtk_obj['gt_ux'] = outputs[:, 0].astype(np.float32)
-                vtk_obj['gt_uy'] = outputs[:, 1].astype(np.float32)
-                vtk_obj['gt_uz'] = outputs[:, 2].astype(np.float32)
-                vtk_obj['gt_vm'] = outputs[:, 3].astype(np.float32)
-                vtk_obj['pred_ux'] = u_pred[:, 0].astype(np.float32)
-                vtk_obj['pred_uy'] = u_pred[:, 1].astype(np.float32)
-                vtk_obj['pred_uz'] = u_pred[:, 2].astype(np.float32)
-                vtk_obj['pred_vm'] = u_pred[:, 3].astype(np.float32)
-                vtk_save_path = os.path.join(overall_vtk_dir, f'{direction}_{filename}.vtk')
-                vtk_obj.save(vtk_save_path)
-            except Exception as e:
-                logging.error(f"Error processing VTK file for '{tcf}': {e}")
-        else:
-            logging.warning(f"VTK file does not exist: {vtk_filepath}")
-    
-    for direction, metrics in direction_metrics.items():
-        npz_path = os.path.join(overall_metrics_each_dir, f'{direction}_metrics.npz')
-        np.savez_compressed(npz_path, metrics=metrics)
-        logging.info(f"Saved metrics for direction '{direction}' to '{npz_path}'")
-
-    for direction, metrics in direction_metrics.items():
-        for comp in components:
-            mae_list = [test_case_metrics[comp]['mae'] for test_case_metrics in metrics.values()]
-            rmse_list = [test_case_metrics[comp]['rmse'] for test_case_metrics in metrics.values()]
-            r2_list = [test_case_metrics[comp]['r2'] for test_case_metrics in metrics.values()]
-            avg_mae = np.mean(mae_list)
-            avg_rmse = np.mean(rmse_list)
-            avg_r2 = np.mean(r2_list)
-            with open(os.path.join(overall_metrics_all_dir, f'{direction}_{comp}_MAE.txt'), 'w') as f_mae:
-                f_mae.write(f"{avg_mae}")
-            with open(os.path.join(overall_metrics_all_dir, f'{direction}_{comp}_RMSE.txt'), 'w') as f_rmse:
-                f_rmse.write(f"{avg_rmse}")
-            with open(os.path.join(overall_metrics_all_dir, f'{direction}_{comp}_R2.txt'), 'w') as f_r2:
-                f_r2.write(f"{avg_r2:.3f}")
-            logging.info(f"Overall Metrics for {direction} {comp}: MAE={avg_mae:.4f}, RMSE={avg_rmse:.4f}, R짼={avg_r2:.4f}")
-
-    for direction, comps in all_metrics.items():
-        for comp, values in comps.items():
-            true_vals = np.array(values['true'])
-            pred_vals = np.array(values['pred'])
-            r2 = calculate_r2(true_vals, pred_vals)
-            plt.figure(figsize=(6,6))
-            plt.scatter(true_vals, pred_vals, alpha=0.3, s=10, label='Data Points')
-            min_val = min(true_vals.min(), pred_vals.min())
-            max_val = max(true_vals.max(), pred_vals.max())
-            plt.plot([min_val, max_val], [min_val, max_val], 'r--', label='Ideal Fit')
-            plt.xlabel(f'True {comp}')
-            plt.ylabel(f'Predicted {comp}')
-            plt.title(f'{direction.capitalize()} Direction: {comp} Prediction vs True\nR짼 = {r2:.3f}')
-            plt.legend(loc="upper left")
-            plt.tight_layout()
-            plt.savefig(os.path.join(overall_plots_dir, f'{direction}_{comp}_scatter.jpg'), dpi=300)
-            plt.close()
+    plot_r2_scatter(test_targets_inv.flatten(), test_outputs_inv.flatten(), 'WSS', 'test', experiment_dir)
 
 if __name__ == "__main__":
     main()
