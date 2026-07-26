@@ -31,11 +31,15 @@ DATA_PATH = "../Data/Sampled/Rpt0_N4096.npz"
 RESULTS_DIR = "../experiments/6_PointNet_Velocity"
 NUM_POINTS = 4096
 VELOCITY_DIM = 50
-N_FOLDS = 10
-MAX_EPOCHS = 3000
-BATCH_SIZE = 10
+# N_FOLDS=3 / MAX_EPOCHS=400 for fast iteration while tuning. Bump N_FOLDS back to 10
+# (and consider raising MAX_EPOCHS) only once the setup is stable and you want the
+# full, rigorous evaluation run.
+N_FOLDS = 3
+MAX_EPOCHS = 400
+BATCH_SIZE = 16
 LEARNING_RATE = 1e-4
 EARLY_STOP_PATIENCE = 50  # epochs of no train-loss improvement before stopping
+GRAD_CLIP_NORM = 1.0      # caps gradient norm, guards against the val-loss spikes seen last run
 SEED = 2024
 
 
@@ -226,6 +230,18 @@ def compute_loss(pred, target, matrix1, matrix2, data_range=1.0):
 # EarlyStopping(monitor='loss') + ModelCheckpoint(monitor='val_loss') pairing.
 # ---------------------------------------------------------------------------
 
+def fold_results_path(fold_idx):
+    # N_FOLDS is baked into the filename deliberately: switching N_FOLDS changes what
+    # the train/test partitions actually are (3-fold and 10-fold split the same 100
+    # patients completely differently), so results from one N_FOLDS setting are never
+    # valid to reuse for another — this naming makes that impossible to mix up by accident.
+    return os.path.join(RESULTS_DIR, f"fold{fold_idx}_of{N_FOLDS}_results.npz")
+
+
+def fold_model_path(fold_idx):
+    return os.path.join(RESULTS_DIR, f"fold{fold_idx}_of{N_FOLDS}_model.pth")
+
+
 def calculate_r2(true_vals, pred_vals):
     ss_res = np.sum((true_vals - pred_vals) ** 2)
     ss_tot = np.sum((true_vals - np.mean(true_vals)) ** 2)
@@ -260,6 +276,7 @@ def train_one_fold(X_train, Y_train, Z_train, X_test, Y_test, Z_test, device, fo
             pred, m1, m2 = model(X_train_t[idx], Z_train_t[idx])
             loss = compute_loss(pred, Y_train_t[idx], m1, m2)
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP_NORM)
             optimizer.step()
             epoch_train_loss += loss.item()
             n_batches += 1
@@ -291,7 +308,7 @@ def train_one_fold(X_train, Y_train, Z_train, X_test, Y_test, Z_test, device, fo
     model.eval()
     with torch.no_grad():
         final_pred, _, _ = model(X_test_t, Z_test_t)
-    return final_pred.cpu().numpy(), best_val_loss
+    return final_pred.cpu().numpy(), best_val_loss, best_state
 
 
 # ---------------------------------------------------------------------------
@@ -323,19 +340,30 @@ def main():
     fold_r2s = []
 
     for fold_idx, (train_ix, test_ix) in enumerate(kf.split(X)):
-        logging.info(f"\n=== Fold {fold_idx} ===")
-        pred_scaled, best_val_loss = train_one_fold(
-            X[train_ix], Y_scaled[train_ix], Z[train_ix],
-            X[test_ix], Y_scaled[test_ix], Z[test_ix],
-            device, fold_idx
-        )
-        pred = pred_scaled * (y_max - y_min) + y_min
-        true = Y[test_ix]
+        results_path = fold_results_path(fold_idx)
 
-        fold_r2 = calculate_r2(true.flatten(), pred.flatten())
+        if os.path.exists(results_path):
+            logging.info(f"\n=== Fold {fold_idx} === (already completed — loading cached results)")
+            cached = np.load(results_path)
+            pred, true, fold_r2 = cached['pred'], cached['true'], float(cached['r2'])
+        else:
+            logging.info(f"\n=== Fold {fold_idx} ===")
+            pred_scaled, best_val_loss, best_state = train_one_fold(
+                X[train_ix], Y_scaled[train_ix], Z[train_ix],
+                X[test_ix], Y_scaled[test_ix], Z[test_ix],
+                device, fold_idx
+            )
+            pred = pred_scaled * (y_max - y_min) + y_min
+            true = Y[test_ix]
+            fold_r2 = calculate_r2(true.flatten(), pred.flatten())
+
+            # Save immediately — if the run gets interrupted later, this fold's work
+            # is not lost, and a re-run will skip straight past it.
+            np.savez_compressed(results_path, pred=pred, true=true, r2=fold_r2, best_val_loss=best_val_loss)
+            torch.save(best_state, fold_model_path(fold_idx))
+            logging.info(f"Fold {fold_idx}: best_val_loss={best_val_loss:.4f}, R2={fold_r2:.4f} (saved to {results_path})")
+
         fold_r2s.append(fold_r2)
-        logging.info(f"Fold {fold_idx}: best_val_loss={best_val_loss:.4f}, R2={fold_r2:.4f}")
-
         all_true.append(true)
         all_pred.append(pred)
 
