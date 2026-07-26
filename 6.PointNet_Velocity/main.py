@@ -54,27 +54,36 @@ def set_seed(seed=SEED):
 # ---------------------------------------------------------------------------
 
 class ConvBlock(nn.Module):
-    """Conv1d(kernel_size=3, same padding) + BatchNorm + SiLU — matches PI's conv_block."""
-    def __init__(self, in_channels, out_channels):
+    """Conv1d(kernel_size=3, same padding) + GroupNorm + SiLU. Matches PI's conv_block,
+    but uses GroupNorm instead of BatchNorm: GroupNorm normalizes using the current
+    input directly (no accumulated running statistics), so there's no train/eval-mode
+    discrepancy — this is what was causing the validation-loss spikes (BatchNorm's
+    running stats, built from small/noisy batches on this small dataset, occasionally
+    miscalibrated for the full eval-mode forward pass)."""
+    def __init__(self, in_channels, out_channels, num_groups=8):
         super().__init__()
         self.conv = nn.Conv1d(in_channels, out_channels, kernel_size=3, padding=1)
-        self.bn = nn.BatchNorm1d(out_channels, momentum=0.5)
+        self.norm = nn.GroupNorm(num_groups, out_channels)
         self.act = nn.SiLU()
 
     def forward(self, x):
-        return self.act(self.bn(self.conv(x)))
+        return self.act(self.norm(self.conv(x)))
 
 
 class MLPBlock(nn.Module):
-    """Dense + BatchNorm + SiLU — matches PI's mlp_block."""
-    def __init__(self, in_features, out_features):
+    """Dense + GroupNorm + SiLU — same GroupNorm-over-BatchNorm reasoning as ConvBlock."""
+    def __init__(self, in_features, out_features, num_groups=8):
         super().__init__()
         self.fc = nn.Linear(in_features, out_features)
-        self.bn = nn.BatchNorm1d(out_features, momentum=0.5)
+        self.norm = nn.GroupNorm(num_groups, out_features)
         self.act = nn.SiLU()
 
     def forward(self, x):
-        return self.act(self.bn(self.fc(x)))
+        # GroupNorm expects (batch, channels, *); x here is (batch, features), so add
+        # and then drop a dummy trailing dim around the normalization.
+        h = self.fc(x)
+        h = self.norm(h.unsqueeze(-1)).squeeze(-1)
+        return self.act(h)
 
 
 class TransformationNet(nn.Module):
