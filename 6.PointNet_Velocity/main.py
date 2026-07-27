@@ -31,10 +31,8 @@ DATA_PATH = "../Data/Sampled/Rpt0_N4096.npz"
 RESULTS_DIR = "../experiments/6_PointNet_Velocity"
 NUM_POINTS = 4096
 VELOCITY_DIM = 50
-# N_FOLDS=3 / MAX_EPOCHS=400 for fast iteration while tuning. Bump N_FOLDS back to 10
-# (and consider raising MAX_EPOCHS) only once the setup is stable and you want the
-# full, rigorous evaluation run.
-N_FOLDS = 3
+# Full 10-fold evaluation run, matching the PI's original methodology.
+N_FOLDS = 10
 MAX_EPOCHS = 400
 BATCH_SIZE = 16
 LEARNING_RATE = 1e-4
