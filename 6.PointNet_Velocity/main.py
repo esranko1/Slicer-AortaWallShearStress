@@ -257,6 +257,17 @@ def calculate_r2(true_vals, pred_vals):
     return 1 - ss_res / ss_tot
 
 
+def concordance_correlation_coefficient(y_true, y_pred):
+    """Concordance correlation coefficient — matches the PI's original function."""
+    cor = np.corrcoef(y_true, y_pred)[0][1]
+    mean_true, mean_pred = np.mean(y_true), np.mean(y_pred)
+    var_true, var_pred = np.var(y_true), np.var(y_pred)
+    sd_true, sd_pred = np.std(y_true), np.std(y_pred)
+    numerator = 2 * cor * sd_true * sd_pred
+    denominator = var_true + var_pred + (mean_true - mean_pred) ** 2
+    return numerator / denominator
+
+
 def train_one_fold(X_train, Y_train, Z_train, X_test, Y_test, Z_test, device, fold_idx):
     model = AortaPointNetVelocity().to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-5)
@@ -347,6 +358,7 @@ def main():
 
     all_true, all_pred = [], []
     fold_r2s = []
+    fold_mses = []
 
     for fold_idx, (train_ix, test_ix) in enumerate(kf.split(X)):
         results_path = fold_results_path(fold_idx)
@@ -373,6 +385,7 @@ def main():
             logging.info(f"Fold {fold_idx}: best_val_loss={best_val_loss:.4f}, R2={fold_r2:.4f} (saved to {results_path})")
 
         fold_r2s.append(fold_r2)
+        fold_mses.append(np.mean((true.flatten() - pred.flatten()) ** 2))
         all_true.append(true)
         all_pred.append(pred)
 
@@ -381,24 +394,51 @@ def main():
 
     overall_r2 = calculate_r2(all_true.flatten(), all_pred.flatten())
     overall_mae = np.mean(np.abs(all_true.flatten() - all_pred.flatten()))
-    overall_rmse = np.sqrt(np.mean((all_true.flatten() - all_pred.flatten()) ** 2))
+    overall_mse = np.mean((all_true.flatten() - all_pred.flatten()) ** 2)
+    overall_rmse = np.sqrt(overall_mse)
 
     patient_true = np.median(all_true, axis=1)
     patient_pred = np.median(all_pred, axis=1)
     pearson_r = np.corrcoef(patient_true, patient_pred)[0, 1]
     spearman_r, spearman_p = spearmanr(patient_true, patient_pred)
+    ccc = concordance_correlation_coefficient(patient_true, patient_pred)
+    slope, intercept = np.polyfit(patient_true, patient_pred, 1)
 
-    logging.info("\n=== Overall results (pooled across all 10 folds) ===")
+    # Region-wise point-level Spearman — same 32 (circumferential) x 128 (longitudinal)
+    # grid slicing the PI's original notebook uses, on the longitudinal axis.
+    n_total = all_true.shape[0]
+    true_grid = all_true.reshape(n_total, 32, 128)
+    pred_grid = all_pred.reshape(n_total, 32, 128)
+    acc_pasc, pval_pasc = spearmanr(true_grid[:, :, 0:36].flatten(), pred_grid[:, :, 0:36].flatten())
+    acc_arch, pval_arch = spearmanr(true_grid[:, :, 36:60].flatten(), pred_grid[:, :, 36:60].flatten())
+    acc_desc, pval_desc = spearmanr(true_grid[:, :, 60:96].flatten(), pred_grid[:, :, 60:96].flatten())
+    acc_abda, pval_abda = spearmanr(true_grid[:, :, 96:128].flatten(), pred_grid[:, :, 96:128].flatten())
+
+    logging.info(f"\n=== Overall results (pooled across all {N_FOLDS} folds) ===")
     logging.info(f"Per-fold R2: {[f'{r:.3f}' for r in fold_r2s]}")
+    logging.info(f"Per-fold MSE: {np.mean(fold_mses):.4f} (+/- {np.std(fold_mses):.4f})")
     logging.info(f"Point-wise MAE: {overall_mae:.4f}")
+    logging.info(f"Point-wise MSE: {overall_mse:.4f}")
     logging.info(f"Point-wise RMSE: {overall_rmse:.4f}")
     logging.info(f"Point-wise R2: {overall_r2:.4f}")
-    logging.info(f"Patient-level Pearson r: {pearson_r:.4f}")
-    logging.info(f"Patient-level Spearman rho: {spearman_r:.4f} (p={spearman_p:.4f})")
+
+    logging.info("\n--- Patient-level diagnostics (matching PI's reporting) ---")
+    logging.info(f"Pearsons correlation: {pearson_r:.3f}")
+    logging.info(f"Spearmans correlation: {spearman_r:.3f} {spearman_p:.3f}")
+    logging.info(f"CCC: {ccc:.3f}")
+    logging.info(f"Slope, Intercept: {slope:.3f} {intercept:.3f}")
+
+    logging.info(
+        "\nSpearmans correlations:\n"
+        f" Proximal Ascending: {acc_pasc:.3f} {pval_pasc:.3f}\n"
+        f" Thoracic Arch: {acc_arch:.3f} {pval_arch:.3f}\n"
+        f" Descending Aorta: {acc_desc:.3f} {pval_desc:.3f}\n"
+        f" Abdominal Aorta: {acc_abda:.3f} {pval_abda:.3f}"
+    )
 
     np.savez_compressed(
         os.path.join(RESULTS_DIR, "results.npz"),
-        all_true=all_true, all_pred=all_pred, fold_r2s=fold_r2s,
+        all_true=all_true, all_pred=all_pred, fold_r2s=fold_r2s, fold_mses=fold_mses,
     )
     logging.info(f"\nSaved results to {RESULTS_DIR}/results.npz")
 
