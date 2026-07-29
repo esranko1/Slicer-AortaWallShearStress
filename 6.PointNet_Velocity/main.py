@@ -53,6 +53,7 @@ BATCH_SIZE = 16
 LEARNING_RATE = 1e-4
 GRAD_CLIP_NORM = 1.0      # caps gradient norm, guards against the val-loss spikes seen last run
 SEED = 2024
+CHECKPOINT_EVERY = 25     # epochs between mid-fold resume checkpoints
 
 def set_seed(seed=SEED):
     torch.manual_seed(seed)
