@@ -42,7 +42,7 @@ VELOCITY_DIM = 50
 # non-negativity) trains stably and looks directionally promising before committing to
 # the full run's wall-clock cost. Fold filenames encode N_FOLDS, so quick-test and
 # full-run results never collide on disk.
-QUICK_TEST = True
+QUICK_TEST = False
 
 if QUICK_TEST:
     N_FOLDS = 3
