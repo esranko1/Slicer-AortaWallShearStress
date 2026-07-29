@@ -36,12 +36,25 @@ DATA_PATH = "../Data/Sampled/Rpt0_N4096.npz"
 RESULTS_DIR = "../experiments/6_PointNet_Velocity"
 NUM_POINTS = 4096
 VELOCITY_DIM = 50
-# Full 10-fold evaluation run, matching the PI's original methodology.
-N_FOLDS = 10
-MAX_EPOCHS = 400
+
+# Flip to False for the full, PI-comparable 10-fold evaluation run. True gives a fast
+# 3-fold smoke test — enough to tell whether the new architecture (multi-task TAWSS +
+# non-negativity) trains stably and looks directionally promising before committing to
+# the full run's wall-clock cost. Fold filenames encode N_FOLDS, so quick-test and
+# full-run results never collide on disk.
+QUICK_TEST = True
+
+if QUICK_TEST:
+    N_FOLDS = 3
+    MAX_EPOCHS = 100
+    EARLY_STOP_PATIENCE = 15
+else:
+    N_FOLDS = 10
+    MAX_EPOCHS = 400
+    EARLY_STOP_PATIENCE = 50
+
 BATCH_SIZE = 16
 LEARNING_RATE = 1e-4
-EARLY_STOP_PATIENCE = 50  # epochs of no train-loss improvement before stopping
 GRAD_CLIP_NORM = 1.0      # caps gradient norm, guards against the val-loss spikes seen last run
 SEED = 2024
 AUX_LOSS_WEIGHT = 0.3     # TAWSS is auxiliary — down-weighted so SWSS (the primary target) still dominates
