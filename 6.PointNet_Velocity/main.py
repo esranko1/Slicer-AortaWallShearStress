@@ -57,7 +57,7 @@ BATCH_SIZE = 16
 LEARNING_RATE = 1e-4
 GRAD_CLIP_NORM = 1.0      # caps gradient norm, guards against the val-loss spikes seen last run
 SEED = 2024
-AUX_LOSS_WEIGHT = 0.3     # TAWSS is auxiliary — down-weighted so SWSS (the primary target) still dominates
+AUX_LOSS_WEIGHT = 0.1     # TAWSS is auxiliary — down-weighted so SWSS (the primary target) still dominates
 CHECKPOINT_EVERY = 25     # epochs between mid-fold resume checkpoints
 
 
