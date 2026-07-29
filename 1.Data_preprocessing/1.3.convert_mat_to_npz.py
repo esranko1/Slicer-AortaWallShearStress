@@ -1,12 +1,13 @@
 """
-Converts the lab's .mat file into the a/b/c .npz format that
-5.Point_DeepONet/main.py expects to load.
+Converts the lab's .mat file into the a/b/c/d .npz format that
+5.Point_DeepONet/main.py and 6.PointNet_Velocity/main.py expect to load.
 
 Target shapes:
     a -> (100, 4096, 53)  : xyz (3 cols) + inlet velocity waveform (50 cols),
                             waveform broadcast identically across all 4096 points per patient
     b -> (100, 4096, 1)   : SWSS
     c -> (100,)           : patient identifiers
+    d -> (100, 4096, 1)   : TAWSS (time-averaged WSS) — auxiliary multi-task target
 """
 
 import os
@@ -27,14 +28,16 @@ def main():
 
     # --- Step 1: load the .mat file -----------------------------------------
     mat = loadmat(MAT_FILE_PATH)
-    X = mat["X"]          # shape (100, 4096, 3)
-    Z = mat["Z"]          # shape (100, 50)
-    SWSS = mat["SWSS"]    # shape (100, 4096)
+    X = mat["X"]                # shape (100, 4096, 3)
+    Z = mat["Z"]                 # shape (100, 50)
+    SWSS = mat["SWSS"]           # shape (100, 4096)
+    TAWSS = mat["TAWSSreal"]     # shape (100, 4096)
 
     print("Loaded shapes:")
     print("  X:", X.shape)
     print("  Z:", Z.shape)
     print("  SWSS:", SWSS.shape)
+    print("  TAWSS:", TAWSS.shape)
 
     # --- Step 1.5: center each patient's point cloud on its own centroid ----
     # Patients' raw coordinates are not co-registered to a common frame (confirmed
@@ -73,14 +76,19 @@ def main():
     # Or reuse your existing patient ID / sno array if you want real IDs.
     c = np.array([str(i) for i in range(100)])
 
+    # --- Step 6: reshape TAWSS into `d` --------------------------------------
+    # (100, 4096) -> (100, 4096, 1), auxiliary multi-task target.
+    d = TAWSS[:, :, np.newaxis]
+
     # --- Sanity checks before saving ----------------------------------------
     print("\nFinal shapes (check these before saving):")
     print("  a:", None if a is None else a.shape, "-> expected (100, 4096, 53)")
     print("  b:", None if b is None else b.shape, "-> expected (100, 4096, 1)")
     print("  c:", None if c is None else c.shape, "-> expected (100,)")
+    print("  d:", None if d is None else d.shape, "-> expected (100, 4096, 1)")
 
-    # --- Step 6: save --------------------------------------------------------
-    np.savez_compressed(OUTPUT_PATH, a=a, b=b, c=c)
+    # --- Step 7: save --------------------------------------------------------
+    np.savez_compressed(OUTPUT_PATH, a=a, b=b, c=c, d=d)
     print(f"\nSaved to {OUTPUT_PATH}")
 
 
