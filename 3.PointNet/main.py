@@ -127,9 +127,6 @@ def process_output(output_components, output_vals, identifiers):
     output_mapping = {'x': 0}
     selected_indices = [output_mapping[comp] for comp in output_components]
     combined_output = output_vals[:, :, selected_indices].astype(np.float32)
-    return combined_output
-            min_val, max_val = clipping_ranges[idx]
-            combined_output[indices, :, j] = np.clip(combined_output[indices, :, j], min_val, max_val)
 
     if combined_output.shape[-1] == 1:
         combined_output = combined_output.squeeze(-1)
@@ -331,11 +328,12 @@ def define_model(args, N_inputs, device):
     """
     Initialize and return a PointNet model.
     """
+    N_outputs = len(args.output_components)
     model = PointNet(
         scaling=args.scaling,
         input_numbers=N_inputs,
         point_numbers=args.N_pt,
-        targets_numbers=4,
+        targets_numbers=N_outputs,
     ).to(device)
     return model
 
