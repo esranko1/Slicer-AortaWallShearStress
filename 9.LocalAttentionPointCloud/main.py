@@ -95,14 +95,20 @@ def compute_local_attention_mask(points, k=K_NEIGHBORS):
 
 class LocalAttentionLayer(nn.Module):
     """
-    Multi-head self-attention with local attention mask.
+    Multi-head self-attention with local attention mask (manual implementation).
     """
     def __init__(self, d_model, nhead, dim_feedforward=2048, dropout=0.1):
         super().__init__()
+        self.d_model = d_model
         self.nhead = nhead
-        self.attention = nn.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=True)
-        self.norm1 = nn.LayerNorm(d_model)
+        self.head_dim = d_model // nhead
 
+        self.q_proj = nn.Linear(d_model, d_model)
+        self.k_proj = nn.Linear(d_model, d_model)
+        self.v_proj = nn.Linear(d_model, d_model)
+        self.out_proj = nn.Linear(d_model, d_model)
+
+        self.norm1 = nn.LayerNorm(d_model)
         self.mlp = nn.Sequential(
             nn.Linear(d_model, dim_feedforward),
             nn.GELU(),
@@ -118,16 +124,42 @@ class LocalAttentionLayer(nn.Module):
         """
         batch_size, num_points, d_model = x.shape
 
-        # Convert bool mask to float: True (attend) → 0, False (mask) → -inf
-        # PyTorch MultiheadAttention expects: 0 = attend, -inf = mask
-        attn_mask_float = attention_mask.float()  # (batch, num_points, num_points)
-        attn_mask_float = attn_mask_float.masked_fill(attn_mask_float == 0, float('-inf'))
+        # Project to Q, K, V
+        Q = self.q_proj(x)  # (batch, num_points, d_model)
+        K = self.k_proj(x)
+        V = self.v_proj(x)
 
-        # Reshape for multi-head attention: (batch*nhead, num_points, num_points)
-        attn_mask_reshaped = attn_mask_float.repeat_interleave(self.nhead, dim=0)
+        # Reshape for multi-head: (batch, num_points, nhead, head_dim) → (batch, nhead, num_points, head_dim)
+        Q = Q.reshape(batch_size, num_points, self.nhead, self.head_dim).transpose(1, 2)
+        K = K.reshape(batch_size, num_points, self.nhead, self.head_dim).transpose(1, 2)
+        V = V.reshape(batch_size, num_points, self.nhead, self.head_dim).transpose(1, 2)
 
-        # Self-attention with local mask
-        attn_out, _ = self.attention(x, x, x, attn_mask=attn_mask_reshaped)
+        # Attention scores: (batch, nhead, num_points, num_points)
+        scores = torch.matmul(Q, K.transpose(-2, -1)) / (self.head_dim ** 0.5)
+
+        # Apply local attention mask
+        # Convert bool mask: True (attend) → stays as-is, False (mask) → set to -inf before softmax
+        mask_float = attention_mask.float()  # (batch, num_points, num_points)
+        mask_float = mask_float.masked_fill(mask_float == 0, float('-inf'))
+        mask_float = mask_float.unsqueeze(1)  # (batch, 1, num_points, num_points) for broadcasting
+
+        scores = scores + mask_float
+
+        # Softmax
+        attn_weights = torch.softmax(scores, dim=-1)
+        attn_weights = torch.nan_to_num(attn_weights, 0.0)  # Handle -inf → 0 after softmax
+        attn_weights = self.dropout(attn_weights)
+
+        # Apply attention to values: (batch, nhead, num_points, num_points) @ (batch, nhead, num_points, head_dim)
+        attn_out = torch.matmul(attn_weights, V)  # (batch, nhead, num_points, head_dim)
+
+        # Reshape back: (batch, nhead, num_points, head_dim) → (batch, num_points, nhead, head_dim) → (batch, num_points, d_model)
+        attn_out = attn_out.transpose(1, 2).reshape(batch_size, num_points, d_model)
+
+        # Output projection
+        attn_out = self.out_proj(attn_out)
+
+        # Residual + norm
         x = x + self.dropout(attn_out)
         x = self.norm1(x)
 
