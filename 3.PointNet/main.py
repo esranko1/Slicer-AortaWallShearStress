@@ -124,7 +124,7 @@ def process_output(output_components, output_vals, identifiers):
     """
     Select output components and apply direction-specific clipping.
     """
-    output_mapping = {'x': 0, 'y': 1, 'z': 2, 's': 3}
+    output_mapping = {'s': 0}
     selected_indices = [output_mapping[comp] for comp in output_components]
     combined_output = output_vals[:, :, selected_indices]
 
