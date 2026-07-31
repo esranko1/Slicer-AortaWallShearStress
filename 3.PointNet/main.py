@@ -154,7 +154,8 @@ def load_and_preprocess_data(args, dir_base_save_model):
     """
     Load data, select components, apply scaling, and prepare train/test splits.
     """
-    tmp = np.load(f'{args.dir_base_load_data}/Rpt{str(args.RUN)}_N{str(args.N_pt)}.npz')
+    tmp_npz = np.load(f'{args.dir_base_load_data}/Rpt{str(args.RUN)}_N{str(args.N_pt)}.npz')
+    tmp = {key: tmp_npz[key] for key in tmp_npz.files}
 
     # Load geometric features if requested
     if args.use_geometric_features:
