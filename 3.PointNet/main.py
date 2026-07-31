@@ -25,7 +25,7 @@ def parse_arguments():
     parser = argparse.ArgumentParser(description='Train PointNet on 3D point cloud data.')
     parser.add_argument('-g', '--gpu', type=int, default=0, help='GPU device ID')
     parser.add_argument('-r', '--RUN', type=int, default=0, help='Run number')
-    parser.add_argument('-ic', '--input_components', type=str, default='xyzmlc', help='Input features (e.g., xyz, xyzd, xyzdmlc)')
+    parser.add_argument('-ic', '--input_components', type=str, default='xyzmlc', help='Input features (e.g., xyz, xyzd, xyzdmlc, xyznd)')
     parser.add_argument('-oc', '--output_components', type=str, default='xyzs', help='Output features (e.g., x, y, z, s, xyz)')
     parser.add_argument('-N_p', '--N_pt', type=int, default=5000, help='Number of points per sample')
     parser.add_argument('-i', '--N_iterations', type=int, default=4000, help='Number of training epochs')
@@ -36,6 +36,8 @@ def parse_arguments():
     parser.add_argument('--split_method', type=str, choices=['mass', 'random'], default='random', help='Data split method')
     parser.add_argument('--scaling', type=float, default=0.53, help='Scaling factor for network channels')
     parser.add_argument('--base_dir', type=str, default='../experiments', help='Base directory for experiment results')
+    parser.add_argument('--use_geometric_features', action='store_true', help='Use pre-computed geometric features (normals + distance)')
+    parser.add_argument('--geometric_features_path', type=str, default='X_with_features.npy', help='Path to pre-computed geometric features')
     args = parser.parse_args()
     return args
 
@@ -72,7 +74,8 @@ def log_parameters(args, device, name):
     logging.info(f'Data Split Method: {args.split_method}')
     logging.info(f'Input components: {args.input_components}')
     logging.info(f'Output components: {args.output_components}')
-    logging.info(f'Scaling factor: {args.scaling}\n\n')
+    logging.info(f'Scaling factor: {args.scaling}')
+    logging.info(f'Use geometric features: {args.use_geometric_features}\n\n')
 
 def get_clipping_ranges_for_direction(direction):
     """
@@ -106,10 +109,10 @@ def process_input(input_components, tmp):
     """
     Select specified input components from the loaded data.
     """
-    input_mapping = {'x': 0, 'y': 1, 'z': 2, 'd': 3, 'm': 4, 'l': 5, 'c': [6, 7, 8]}
+    input_mapping = {'x': 0, 'y': 1, 'z': 2, 'd': 3, 'm': 4, 'l': 5, 'c': [6, 7, 8], 'n': [9, 10, 11]}
     selected_indices = []
     for comp in input_components:
-        if comp == 'c':
+        if comp in ['c', 'n']:
             selected_indices.extend(input_mapping[comp])
         elif comp in input_mapping:
             selected_indices.append(input_mapping[comp])
@@ -152,6 +155,28 @@ def load_and_preprocess_data(args, dir_base_save_model):
     Load data, select components, apply scaling, and prepare train/test splits.
     """
     tmp = np.load(f'{args.dir_base_load_data}/Rpt{str(args.RUN)}_N{str(args.N_pt)}.npz')
+
+    # Load geometric features if requested
+    if args.use_geometric_features:
+        try:
+            geometric_features = np.load(args.geometric_features_path)  # shape: (100, 4096, 7)
+            # Extract normals (indices 3:6) and distance (index 6)
+            # geometric_features[:, :, 3:7] = [nx, ny, nz, distance]
+            # We'll add these as indices 9, 10, 11 in the input_mapping
+
+            # Concatenate geometric features to existing data
+            # Original tmp['a'] shape: (num_patients, 4096, existing_dims)
+            # We need to add 4 new dimensions: nx, ny, nz, distance
+            geometric_data = geometric_features[:, :, 3:7].astype(np.float32)  # [nx, ny, nz, distance]
+            combined_input_base = process_input(args.input_components, tmp)
+
+            # But wait - we need to modify tmp['a'] to include geometric features
+            # Let's concatenate the geometric data to tmp['a'] first
+            tmp['a'] = np.concatenate([tmp['a'], geometric_data], axis=2)
+            logging.info(f"Loaded geometric features from {args.geometric_features_path}")
+            logging.info(f"Input data shape after concatenation: {tmp['a'].shape}")
+        except FileNotFoundError:
+            logging.warning(f"Geometric features file not found at {args.geometric_features_path}. Proceeding without geometric features.")
 
     combined_input = process_input(args.input_components, tmp)
     combined_output = process_output(args.output_components, tmp['b'], tmp['c'])
