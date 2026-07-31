@@ -7,6 +7,7 @@ import pickle
 import numpy as np
 from sklearn.preprocessing import MinMaxScaler
 from sklearn.metrics import r2_score
+from scipy.stats import pearsonr, spearmanr
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -360,6 +361,21 @@ def calculate_r2(true_vals, pred_vals):
     pred_flat = pred_vals.reshape(-1, pred_vals.shape[-1])
     return r2_score(true_flat, pred_flat, multioutput='raw_values')
 
+def calculate_pearson_per_patient(true_vals, pred_vals):
+    """
+    Calculate per-patient Pearson correlation for each output component.
+    true_vals, pred_vals: shape (N_patients, N_points, N_components)
+    Returns: shape (N_patients, N_components)
+    """
+    n_patients = true_vals.shape[0]
+    n_components = true_vals.shape[-1]
+    per_patient_r = np.zeros((n_patients, n_components))
+    for p in range(n_patients):
+        for c in range(n_components):
+            r, _ = pearsonr(true_vals[p, :, c], pred_vals[p, :, c])
+            per_patient_r[p, c] = r
+    return per_patient_r
+
 def train_model(model, train_loader, test_loader, args, output_scalers, experiment_dir, device):
     """
     Train the PointNet model and save intermediate checkpoints and metrics.
@@ -480,6 +496,19 @@ def evaluate_model(model, test_loader, output_scalers, test_case_file, args, exp
     targets_original = output_scalers.inverse_transform(all_targets.reshape(-1, all_targets.shape[-1])).reshape(all_targets.shape)
 
     components = list(args.output_components)
+
+    # Overall per-patient Pearson correlation (median aggregation), comparable to the baseline metric
+    per_patient_pearson = calculate_pearson_per_patient(targets_original, outputs_original)
+    median_pearson = np.median(per_patient_pearson, axis=0)
+    mean_pearson = np.mean(per_patient_pearson, axis=0)
+    for i, comp in enumerate(components):
+        logging.info(f"\nOverall Pearson for {comp} (N={per_patient_pearson.shape[0]} patients): "
+                     f"median={median_pearson[i]:.4f}, mean={mean_pearson[i]:.4f}\n")
+    np.save(os.path.join(experiment_dir, 'per_patient_pearson.npy'), per_patient_pearson)
+    with open(os.path.join(experiment_dir, 'overall_pearson_summary.txt'), 'w') as f:
+        for i, comp in enumerate(components):
+            f.write(f"{comp}: median={median_pearson[i]:.4f}, mean={mean_pearson[i]:.4f}\n")
+
     directions = [tcf.split('_')[0] for tcf in test_case_file]
     unique_directions = list(set(directions))
 
@@ -505,6 +534,7 @@ def evaluate_model(model, test_loader, output_scalers, test_case_file, args, exp
             mae = np.mean(np.abs(pred_comp - true_comp))
             rmse = np.sqrt(np.mean((pred_comp - true_comp) ** 2))
             r2 = r2_score(true_comp, pred_comp)
+            pearson_r, pearson_p = pearsonr(true_comp, pred_comp)
 
             with open(os.path.join(subset_metrics_all_dir, f'{direction}_{comp}_MAE.txt'), 'w') as f_mae:
                 f_mae.write(f"{mae}")
@@ -512,8 +542,10 @@ def evaluate_model(model, test_loader, output_scalers, test_case_file, args, exp
                 f_rmse.write(f"{rmse}")
             with open(os.path.join(subset_metrics_all_dir, f'{direction}_{comp}_R2.txt'), 'w') as f_r2:
                 f_r2.write(f"{r2:.3f}")
+            with open(os.path.join(subset_metrics_all_dir, f'{direction}_{comp}_Pearson.txt'), 'w') as f_pearson:
+                f_pearson.write(f"{pearson_r:.3f}")
 
-            logging.info(f"Subset Metrics for {direction} {comp}: MAE={mae:.4f}, RMSE={rmse:.4f}, R2={r2:.4f}")
+            logging.info(f"Subset Metrics for {direction} {comp}: MAE={mae:.4f}, RMSE={rmse:.4f}, R2={r2:.4f}, Pearson={pearson_r:.3f}")
             plot_r2_scatter(true_comp, pred_comp, comp, direction, subset_plots_dir)
 
 def plot_r2_scatter(true_vals, pred_vals, comp, direction, experiment_dir):
