@@ -106,16 +106,29 @@ def get_clipping_ranges_for_direction(direction):
     else:
         raise ValueError(f"Unknown direction: {direction}")
 
-def process_input(input_components, tmp):
+def process_input(input_components, tmp, geo_normal_indices=None, geo_distance_index=None):
     """
     Select specified input components from the loaded data.
+
+    'a' columns are: xyz (0-2), inlet velocity waveform (3-52, unused here since
+    velocity conditioning was ablated and found to hurt Pearson), and, when
+    --use_geometric_features is set, normals + inlet distance appended at the end.
     """
-    input_mapping = {'x': 0, 'y': 1, 'z': 2, 'd': 3, 'm': 4, 'l': 5, 'c': [6, 7, 8], 'n': [9, 10, 11]}
+    input_mapping = {'x': 0, 'y': 1, 'z': 2}
+    if geo_normal_indices is not None:
+        input_mapping['n'] = geo_normal_indices
+    if geo_distance_index is not None:
+        input_mapping['d'] = geo_distance_index
+
     selected_indices = []
     for comp in input_components:
-        if comp in ['c', 'n']:
+        if comp not in input_mapping:
+            raise ValueError(f"Unknown or unavailable input component '{comp}'. "
+                              f"Available: {sorted(input_mapping.keys())} "
+                              f"(pass --use_geometric_features to enable 'n' and 'd').")
+        if comp == 'n':
             selected_indices.extend(input_mapping[comp])
-        elif comp in input_mapping:
+        else:
             selected_indices.append(input_mapping[comp])
 
     trunk_input = tmp['a'][:, :, selected_indices].astype(np.float32)
@@ -143,29 +156,28 @@ def load_and_preprocess_data(args, dir_base_save_model):
     tmp_npz = np.load(f'{args.dir_base_load_data}/Rpt{str(args.RUN)}_N{str(args.N_pt)}.npz')
     tmp = {key: tmp_npz[key] for key in tmp_npz.files}
 
-    # Load geometric features if requested
+    # Load geometric features if requested. These get appended after whatever
+    # columns are already in 'a' (xyz + velocity waveform), so the normals/distance
+    # indices depend on 'a's width *before* concatenation, not a fixed offset.
+    geo_normal_indices = None
+    geo_distance_index = None
     if args.use_geometric_features:
         try:
             geometric_features = np.load(args.geometric_features_path)  # shape: (100, 4096, 7)
-            # Extract normals (indices 3:6) and distance (index 6)
-            # geometric_features[:, :, 3:7] = [nx, ny, nz, distance]
-            # We'll add these as indices 9, 10, 11 in the input_mapping
-
-            # Concatenate geometric features to existing data
-            # Original tmp['a'] shape: (num_patients, 4096, existing_dims)
-            # We need to add 4 new dimensions: nx, ny, nz, distance
             geometric_data = geometric_features[:, :, 3:7].astype(np.float32)  # [nx, ny, nz, distance]
-            combined_input_base = process_input(args.input_components, tmp)
 
-            # But wait - we need to modify tmp['a'] to include geometric features
-            # Let's concatenate the geometric data to tmp['a'] first
+            base_input_dim = tmp['a'].shape[2]
             tmp['a'] = np.concatenate([tmp['a'], geometric_data], axis=2)
+            geo_normal_indices = [base_input_dim, base_input_dim + 1, base_input_dim + 2]
+            geo_distance_index = base_input_dim + 3
+
             logging.info(f"Loaded geometric features from {args.geometric_features_path}")
-            logging.info(f"Input data shape after concatenation: {tmp['a'].shape}")
+            logging.info(f"Input data shape after concatenation: {tmp['a'].shape} "
+                         f"(normals at {geo_normal_indices}, distance at {geo_distance_index})")
         except FileNotFoundError:
             logging.warning(f"Geometric features file not found at {args.geometric_features_path}. Proceeding without geometric features.")
 
-    combined_input = process_input(args.input_components, tmp)
+    combined_input = process_input(args.input_components, tmp, geo_normal_indices, geo_distance_index)
     combined_output = process_output(args.output_components, tmp['b'], tmp['c'])
 
     # Scale inputs
