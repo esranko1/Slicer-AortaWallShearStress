@@ -39,8 +39,25 @@ def parse_arguments():
     parser.add_argument('--base_dir', type=str, default='../experiments', help='Base directory for experiment results')
     parser.add_argument('--use_geometric_features', action='store_true', help='Use pre-computed geometric features (normals + distance)')
     parser.add_argument('--geometric_features_path', type=str, default='X_with_features.npy', help='Path to pre-computed geometric features')
+    parser.add_argument('--fold', type=int, default=None, help='K-fold index (0..n_folds-1). If set, overrides --split_method with a deterministic K-fold split.')
+    parser.add_argument('--n_folds', type=int, default=10, help='Number of folds for K-fold cross-validation')
     args = parser.parse_args()
     return args
+
+def get_fold_indices(n_samples, fold_idx, n_folds=10, seed=2024):
+    """
+    Deterministic K-fold split over positional indices [0, n_samples).
+    Every index appears in exactly one validation fold across fold_idx=0..n_folds-1.
+    """
+    rng = np.random.default_rng(seed=seed)
+    shuffled = rng.permutation(n_samples)
+    fold_sizes = np.full(n_folds, n_samples // n_folds, dtype=int)
+    fold_sizes[: n_samples % n_folds] += 1
+    boundaries = np.cumsum(fold_sizes)
+    starts = np.concatenate(([0], boundaries[:-1]))
+    valid_idx = shuffled[starts[fold_idx]:boundaries[fold_idx]]
+    train_idx = np.setdiff1d(shuffled, valid_idx)
+    return train_idx, valid_idx
 
 def setup_logging(args, name):
     """
@@ -192,16 +209,19 @@ def load_and_preprocess_data(args, dir_base_save_model):
     pickle.dump(combined_scalers, open(f'{dir_base_save_model}/combined_scaler.pkl', 'wb'))
     pickle.dump(output_scalers, open(f'{dir_base_save_model}/output_scaler.pkl', 'wb'))
     
-    # Determine split file
-    if args.split_method == 'random':
-        split_file = f'../data/npy/combined_{args.N_samples}_split_random_train_valid.npz'
+    if args.fold is not None:
+        train_case, test_case = get_fold_indices(len(tmp['c']), args.fold, args.n_folds)
     else:
-        split_file = f'../data/npy/combined_{args.N_samples}_split_mass_train_valid.npz'
+        # Determine split file
+        if args.split_method == 'random':
+            split_file = f'../data/npy/combined_{args.N_samples}_split_random_train_valid.npz'
+        else:
+            split_file = f'../data/npy/combined_{args.N_samples}_split_mass_train_valid.npz'
 
-    # Load train/valid splits
-    split_data = np.load(split_file)
-    train_case = map_keys_to_indices(split_data['train'], np.array([key for key in tmp['c']]))
-    test_case = map_keys_to_indices(split_data['valid'], np.array([key for key in tmp['c']]))
+        # Load train/valid splits
+        split_data = np.load(split_file)
+        train_case = map_keys_to_indices(split_data['train'], np.array([key for key in tmp['c']]))
+        test_case = map_keys_to_indices(split_data['valid'], np.array([key for key in tmp['c']]))
 
     train_case_file = tmp['c'][train_case]
     test_case_file = tmp['c'][test_case]
@@ -517,6 +537,7 @@ def evaluate_model(model, test_loader, output_scalers, test_case_file, args, exp
         logging.info(f"\nOverall Pearson for {comp} (N={per_patient_pearson.shape[0]} patients): "
                      f"median={median_pearson[i]:.4f}, mean={mean_pearson[i]:.4f}\n")
     np.save(os.path.join(experiment_dir, 'per_patient_pearson.npy'), per_patient_pearson)
+    np.save(os.path.join(experiment_dir, 'per_patient_ids.npy'), np.array(test_case_file))
     with open(os.path.join(experiment_dir, 'overall_pearson_summary.txt'), 'w') as f:
         for i, comp in enumerate(components):
             f.write(f"{comp}: median={median_pearson[i]:.4f}, mean={mean_pearson[i]:.4f}\n")
@@ -584,7 +605,8 @@ def main():
     """
     args = parse_arguments()
     device = get_device(args.gpu)
-    name = f'PointNet_RUN{args.RUN}_D{args.N_samples}_N{args.N_pt}_input_{args.input_components}_output_{args.output_components}_split_{args.split_method}_scaling_{args.scaling}'
+    split_label = f'fold{args.fold}of{args.n_folds}' if args.fold is not None else args.split_method
+    name = f'PointNet_RUN{args.RUN}_D{args.N_samples}_N{args.N_pt}_input_{args.input_components}_output_{args.output_components}_split_{split_label}_scaling_{args.scaling}'
     experiment_dir = setup_logging(args, name)
     log_parameters(args, device, name)
 
