@@ -1,12 +1,25 @@
 """
-Transformer on point clouds for WSS prediction. Self-attention over all 4096 points,
-no mesh needed, learns which points matter for each prediction.
+Hybrid: PointNet feature extraction + Transformer refinement.
 
-Expects Data/Sampled/Rpt0_N4096.npz (built by 1.Data_preprocessing/1.3.convert_mat_to_npz.py),
-with arrays:
-    a -> (100, 4096, 53) : xyz (cols 0-2) + inlet velocity waveform (cols 3-52)
-    b -> (100, 4096, 1)  : SWSS
-    c -> (100,)          : patient identifiers
+PointNet's T-Nets and convolutional feature extraction are proven to work well
+for point clouds. Instead of max-pooling + broadcasting (PointNet's bottleneck),
+this model concatenates multi-scale features and applies Transformer self-attention
+to learn spatial relationships between points.
+
+Flow:
+    points (batch, 4096, 3)
+      ↓
+    PointNet conv layers (multi-scale feature extraction)
+      ↓
+    concatenate features from all scales: (batch, 3008, 4096)
+      ↓
+    reshape to (batch, 4096, 3008)
+      ↓
+    Transformer: self-attention over points with multi-scale features
+      ↓
+    output head: per-point WSS prediction
+
+Expects Data/Sampled/Rpt0_N4096.npz (built by 1.Data_preprocessing/1.3.convert_mat_to_npz.py).
 """
 
 import os
@@ -22,9 +35,8 @@ from scipy.stats import spearmanr
 logging.basicConfig(level=logging.INFO, format='%(message)s')
 
 DATA_PATH = "../Data/Sampled/Rpt0_N4096.npz"
-RESULTS_DIR = "../experiments/7_PointTransformer"
+RESULTS_DIR = "../experiments/8_HybridPointTransformer"
 NUM_POINTS = 4096
-VELOCITY_DIM = 50
 
 QUICK_TEST = False
 
@@ -55,30 +67,124 @@ def set_seed(seed=SEED):
 
 
 # ---------------------------------------------------------------------------
-# Model — Transformer on point clouds
+# PointNet components (feature extraction only, no max-pooling)
 # ---------------------------------------------------------------------------
 
-class PointTransformer(nn.Module):
-    """
-    Transformer-based point cloud processor for WSS prediction.
-    Self-attention over all points learns spatial patterns without max-pooling bottleneck.
-    """
-    def __init__(self, input_channels=3, output_channels=1, d_model=D_MODEL,
-                 nhead=NHEAD, num_layers=NUM_LAYERS):
+class ConvBlock(nn.Module):
+    """Conv1d + GroupNorm + SiLU. Uses GroupNorm (no train/eval mismatch)."""
+    def __init__(self, in_channels, out_channels, num_groups=8):
         super().__init__()
-        self.d_model = d_model
+        self.conv = nn.Conv1d(in_channels, out_channels, kernel_size=3, padding=1)
+        self.norm = nn.GroupNorm(num_groups, out_channels)
+        self.act = nn.SiLU()
 
-        # Point embedding: map from 3D coordinates to d_model dimensions
-        self.point_embed = nn.Sequential(
-            nn.Linear(input_channels, d_model),
-            nn.SiLU(),
-            nn.Linear(d_model, d_model)
-        )
+    def forward(self, x):
+        return self.act(self.norm(self.conv(x)))
 
-        # Positional encoding: learned position embeddings (alternative to sinusoidal)
-        self.pos_embed = nn.Linear(input_channels, d_model)
 
-        # Transformer encoder: self-attention over all points
+class MLPBlock(nn.Module):
+    """Dense + GroupNorm + SiLU."""
+    def __init__(self, in_features, out_features, num_groups=8):
+        super().__init__()
+        self.fc = nn.Linear(in_features, out_features)
+        self.norm = nn.GroupNorm(num_groups, out_features)
+        self.act = nn.SiLU()
+
+    def forward(self, x):
+        h = self.fc(x)
+        h = self.norm(h.unsqueeze(-1)).squeeze(-1)
+        return self.act(h)
+
+
+class TransformationNet(nn.Module):
+    """Learns alignment matrix, initialized to identity."""
+    def __init__(self, num_features):
+        super().__init__()
+        self.num_features = num_features
+        self.conv1 = ConvBlock(num_features, 64)
+        self.conv2 = ConvBlock(64, 128)
+        self.conv3 = ConvBlock(128, 1024)
+        self.mlp1 = MLPBlock(1024, 512)
+        self.mlp2 = MLPBlock(512, 256)
+        self.fc_final = nn.Linear(256, num_features * num_features)
+        nn.init.zeros_(self.fc_final.weight)
+        with torch.no_grad():
+            self.fc_final.bias.copy_(torch.eye(num_features).flatten())
+
+    def forward(self, x):
+        h = self.conv1(x)
+        h = self.conv2(h)
+        h = self.conv3(h)
+        h = h.max(dim=2)[0]
+        h = self.mlp1(h)
+        h = self.mlp2(h)
+        matrix = self.fc_final(h)
+        return matrix.view(-1, self.num_features, self.num_features)
+
+
+class TransformationBlock(nn.Module):
+    """Applies learned alignment matrix."""
+    def __init__(self, num_features):
+        super().__init__()
+        self.transform_net = TransformationNet(num_features)
+
+    def forward(self, x):
+        matrix = self.transform_net(x)
+        x_t = x.transpose(1, 2)
+        transformed = torch.bmm(x_t, matrix)
+        return transformed.transpose(1, 2), matrix
+
+
+class PointNetFeatureExtractor(nn.Module):
+    """PointNet feature extraction: returns multi-scale features before max-pooling."""
+    def __init__(self):
+        super().__init__()
+        self.input_transform = TransformationBlock(3)
+        self.conv64 = ConvBlock(3, 64)
+        self.conv128_1 = ConvBlock(64, 128)
+        self.conv128_2 = ConvBlock(128, 128)
+        self.feature_transform = TransformationBlock(128)
+        self.conv512 = ConvBlock(128, 512)
+        self.conv2048 = ConvBlock(512, 2048)
+
+    def forward(self, points):
+        """
+        points: (batch, num_points, 3)
+        returns: multi-scale features (batch, 3008, num_points), transformation matrices
+        """
+        x = points.transpose(1, 2)  # (batch, 3, num_points)
+
+        x_t, matrix1 = self.input_transform(x)
+        f64 = self.conv64(x_t)               # (batch, 64, num_points)
+        f128_1 = self.conv128_1(f64)         # (batch, 128, num_points)
+        f128_2 = self.conv128_2(f128_1)      # (batch, 128, num_points)
+        f_transformed, matrix2 = self.feature_transform(f128_2)
+        f512 = self.conv512(f_transformed)   # (batch, 512, num_points)
+        f2048 = self.conv2048(f512)          # (batch, 2048, num_points)
+
+        # Concatenate all features: (batch, 64+128+128+128+512+2048, num_points)
+        # = (batch, 3008, num_points)
+        seg_input = torch.cat([f64, f128_1, f128_2, f_transformed, f512, f2048], dim=1)
+
+        return seg_input, matrix1, matrix2
+
+
+# ---------------------------------------------------------------------------
+# Hybrid model: PointNet feature extraction + Transformer
+# ---------------------------------------------------------------------------
+
+class HybridPointTransformer(nn.Module):
+    """
+    Hybrid: PointNet extracts multi-scale features (3008-dim), Transformer refines.
+    """
+    def __init__(self, d_model=D_MODEL, nhead=NHEAD, num_layers=NUM_LAYERS):
+        super().__init__()
+        self.feature_extractor = PointNetFeatureExtractor()
+
+        # Project 3008-dim features to d_model
+        self.feature_proj = nn.Linear(3008, d_model)
+
+        # Transformer: self-attention over points
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=d_model,
             nhead=nhead,
@@ -89,43 +195,44 @@ class PointTransformer(nn.Module):
         )
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
 
-        # Output head: predict one value per point
+        # Output head: predict one WSS value per point
         self.head = nn.Sequential(
             nn.Linear(d_model, d_model // 2),
             nn.SiLU(),
-            nn.Linear(d_model // 2, output_channels)
+            nn.Linear(d_model // 2, 1)
         )
 
     def forward(self, points):
         """
         points: (batch, num_points, 3)
-        output: (batch, num_points)
+        output: (batch, num_points), transformation matrices
         """
-        # Embed point coordinates
-        x = self.point_embed(points)  # (batch, num_points, d_model)
+        # Extract multi-scale PointNet features
+        feat, matrix1, matrix2 = self.feature_extractor(points)
+        # feat: (batch, 3008, num_points)
 
-        # Add positional encoding
-        pos = self.pos_embed(points)  # (batch, num_points, d_model)
-        x = x + pos
+        # Transpose to (batch, num_points, 3008)
+        feat_t = feat.transpose(1, 2)
 
-        # Transformer: self-attention learns dependencies between all points
-        x = self.transformer(x)  # (batch, num_points, d_model)
+        # Project to d_model
+        feat_proj = self.feature_proj(feat_t)  # (batch, num_points, d_model)
 
-        # Per-point output
-        out = self.head(x)  # (batch, num_points, 1)
+        # Transformer: self-attention between points
+        feat_refined = self.transformer(feat_proj)  # (batch, num_points, d_model)
 
-        # Apply SiLU activation (same as PointNet baseline)
+        # Per-point WSS prediction
+        out = self.head(feat_refined)  # (batch, num_points, 1)
         out = F.silu(out.squeeze(-1))  # (batch, num_points)
 
-        return out
+        return out, matrix1, matrix2
 
 
 # ---------------------------------------------------------------------------
-# Loss — same SSIM + MAE as PointNet baseline
+# Loss — same SSIM + MAE + orthogonality regularization as PointNet
 # ---------------------------------------------------------------------------
 
 def compute_ssim(pred, target, data_range=1.0, window_size=3):
-    """Lightweight single-scale SSIM (average-pooling window). pred/target: (batch, 1, H, W)."""
+    """SSIM loss (spatial structure)."""
     C1 = (0.01 * data_range) ** 2
     C2 = (0.03 * data_range) ** 2
     pad = window_size // 2
@@ -145,7 +252,15 @@ def compute_ssim(pred, target, data_range=1.0, window_size=3):
     return ssim_map.mean()
 
 
-def compute_loss(pred, target, data_range=1.0):
+def orthogonal_regularization(matrix, l2reg=0.01):
+    """Penalizes deviation from orthogonality."""
+    num_features = matrix.shape[-1]
+    identity = torch.eye(num_features, device=matrix.device).unsqueeze(0)
+    mmt = torch.bmm(matrix, matrix.transpose(1, 2))
+    return l2reg * torch.mean(torch.sum((mmt - identity) ** 2, dim=(1, 2)))
+
+
+def compute_loss(pred, target, matrix1, matrix2, data_range=1.0):
     batch_size = pred.shape[0]
     pred_grid = pred.reshape(batch_size, 1, 32, 128)
     target_grid = target.reshape(batch_size, 1, 32, 128)
@@ -154,11 +269,12 @@ def compute_loss(pred, target, data_range=1.0):
     ssim_val = compute_ssim(pred_grid, target_grid, data_range=data_range)
     ssim_loss = 2 * mae + 1 - ssim_val
 
-    return ssim_loss
+    reg_loss = orthogonal_regularization(matrix1) + orthogonal_regularization(matrix2)
+    return ssim_loss + reg_loss
 
 
 # ---------------------------------------------------------------------------
-# Training — one fold with mid-fold checkpointing
+# Training
 # ---------------------------------------------------------------------------
 
 def fold_results_path(fold_idx):
@@ -180,7 +296,7 @@ def calculate_r2(true_vals, pred_vals):
 
 
 def concordance_correlation_coefficient(y_true, y_pred):
-    """Concordance correlation coefficient — matches the PI's original function."""
+    """CCC."""
     cor = np.corrcoef(y_true, y_pred)[0][1]
     mean_true, mean_pred = np.mean(y_true), np.mean(y_pred)
     var_true, var_pred = np.var(y_true), np.var(y_pred)
@@ -191,7 +307,7 @@ def concordance_correlation_coefficient(y_true, y_pred):
 
 
 def train_one_fold(X_train, Y_train, Z_train, X_test, Y_test, Z_test, device, fold_idx):
-    model = PointTransformer().to(device)
+    model = HybridPointTransformer().to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-5)
 
     X_train_t = torch.tensor(X_train, dtype=torch.float32, device=device)
@@ -201,7 +317,6 @@ def train_one_fold(X_train, Y_train, Z_train, X_test, Y_test, Z_test, device, fo
     Y_test_t = torch.tensor(Y_test, dtype=torch.float32, device=device)
     Z_test_t = torch.tensor(Z_test, dtype=torch.float32, device=device)
 
-    # Verify data on GPU
     if device.type == 'cuda':
         logging.info(f"  Fold {fold_idx}: Data on GPU ✓ ({X_train_t.device}, {Y_train_t.device})")
         logging.info(f"  GPU memory: {torch.cuda.memory_allocated() / 1e9:.2f}GB used")
@@ -213,7 +328,6 @@ def train_one_fold(X_train, Y_train, Z_train, X_test, Y_test, Z_test, device, fo
     epochs_without_train_improvement = 0
     best_train_loss = float('inf')
 
-    # Resume mid-fold training if available
     resume_path = resume_checkpoint_path(fold_idx)
     if os.path.exists(resume_path):
         checkpoint = torch.load(resume_path, map_location=device)
@@ -235,8 +349,8 @@ def train_one_fold(X_train, Y_train, Z_train, X_test, Y_test, Z_test, device, fo
         for start in range(0, n_train, BATCH_SIZE):
             idx = perm[start:start + BATCH_SIZE]
             optimizer.zero_grad()
-            pred = model(X_train_t[idx])
-            loss = compute_loss(pred, Y_train_t[idx])
+            pred, m1, m2 = model(X_train_t[idx])
+            loss = compute_loss(pred, Y_train_t[idx], m1, m2)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP_NORM)
             optimizer.step()
@@ -246,8 +360,8 @@ def train_one_fold(X_train, Y_train, Z_train, X_test, Y_test, Z_test, device, fo
 
         model.eval()
         with torch.no_grad():
-            val_pred = model(X_test_t)
-            val_loss = compute_loss(val_pred, Y_test_t).item()
+            val_pred, vm1, vm2 = model(X_test_t)
+            val_loss = compute_loss(val_pred, Y_test_t, vm1, vm2).item()
 
         if val_loss < best_val_loss:
             best_val_loss = val_loss
@@ -282,7 +396,7 @@ def train_one_fold(X_train, Y_train, Z_train, X_test, Y_test, Z_test, device, fo
     model.load_state_dict(best_state)
     model.eval()
     with torch.no_grad():
-        final_pred = model(X_test_t)
+        final_pred, _, _ = model(X_test_t)
 
     if os.path.exists(resume_path):
         os.remove(resume_path)
@@ -291,7 +405,7 @@ def train_one_fold(X_train, Y_train, Z_train, X_test, Y_test, Z_test, device, fo
 
 
 # ---------------------------------------------------------------------------
-# Main — 10-fold CV, matching PI's evaluation methodology
+# Main
 # ---------------------------------------------------------------------------
 
 def main():
