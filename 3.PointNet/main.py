@@ -127,9 +127,6 @@ def process_output(output_components, output_vals, identifiers):
     output_mapping = {'x': 0}
     selected_indices = [output_mapping[comp] for comp in output_components]
     combined_output = output_vals[:, :, selected_indices].astype(np.float32)
-
-    if combined_output.shape[-1] == 1:
-        combined_output = combined_output.squeeze(-1)
     return combined_output
 
 def map_keys_to_indices(keys, all_keys):
@@ -374,7 +371,10 @@ def train_model(model, train_loader, test_loader, args, output_scalers, experime
     train_losses, val_losses = [], []
     total_training_time = 0
 
-    logging.info("Epoch    Train Loss Val Loss   MAE_ux MAE_uy MAE_uz MAE_vm R2_ux R2_uy R2_uz R2_vm Elapsed Time (s)")
+    output_labels = list(args.output_components)
+    mae_header = ' '.join(f'MAE_{lbl}' for lbl in output_labels)
+    r2_header = ' '.join(f'R2_{lbl}' for lbl in output_labels)
+    logging.info(f"Epoch    Train Loss Val Loss   {mae_header} {r2_header} Elapsed Time (s)")
 
     for epoch in range(args.N_iterations):
         model.train()
@@ -421,9 +421,10 @@ def train_model(model, train_loader, test_loader, args, output_scalers, experime
         mae = calculate_mae(targets_original, outputs_original)
         r2 = calculate_r2(targets_original, outputs_original)
 
+        mae_str = ', '.join(f'{v:.2e}' for v in mae)
+        r2_str = ', '.join(f'{v:.2e}' for v in r2)
         logging.info(f"[{epoch+1}/{args.N_iterations}] [{train_loss_epoch:.2e}] [{val_loss_epoch:.2e}] "
-                     f"[{mae[0]:.2e}, {mae[1]:.2e}, {mae[2]:.2e}, {mae[3]:.2e}, "
-                     f"{r2[0]:.2e}, {r2[1]:.2e}, {r2[2]:.2e}, {r2[3]:.2e}] {total_training_time:.2f}s")
+                     f"[{mae_str}, {r2_str}] {total_training_time:.2f}s")
 
         scheduler.step()
 
@@ -478,7 +479,7 @@ def evaluate_model(model, test_loader, output_scalers, test_case_file, args, exp
     outputs_original = output_scalers.inverse_transform(all_outputs.reshape(-1, all_outputs.shape[-1])).reshape(all_outputs.shape)
     targets_original = output_scalers.inverse_transform(all_targets.reshape(-1, all_targets.shape[-1])).reshape(all_targets.shape)
 
-    components = ['ux', 'uy', 'uz', 'vm']
+    components = list(args.output_components)
     directions = [tcf.split('_')[0] for tcf in test_case_file]
     unique_directions = list(set(directions))
 
