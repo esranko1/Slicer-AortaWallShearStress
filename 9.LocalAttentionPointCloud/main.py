@@ -99,6 +99,7 @@ class LocalAttentionLayer(nn.Module):
     """
     def __init__(self, d_model, nhead, dim_feedforward=2048, dropout=0.1):
         super().__init__()
+        self.nhead = nhead
         self.attention = nn.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=True)
         self.norm1 = nn.LayerNorm(d_model)
 
@@ -115,22 +116,18 @@ class LocalAttentionLayer(nn.Module):
         x: (batch, num_points, d_model)
         attention_mask: (batch, num_points, num_points) bool, True = attend, False = mask
         """
-        # Convert bool mask to attention mask (PyTorch expects -inf for masked positions)
-        # MultiheadAttention.forward expects attn_mask of shape (L, S) or (batch*nhead, L, S)
-        # where True/1 means *keep*, False/0 means *mask*
-        attn_mask = ~attention_mask  # Flip: True → mask out, False → keep
-        attn_mask = attn_mask.float().masked_fill(attn_mask, float('-inf'))
-        # Actually, let's use the proper format: False means attend, True means mask
-        # PyTorch attention_mask: True = masked (ignore), False = not masked (attend)
-        attn_mask_pt = attention_mask.logical_not().float()
-        attn_mask_pt = attn_mask_pt.masked_fill(attn_mask_pt == 1, float('-inf'))
-        attn_mask_pt = attn_mask_pt.masked_fill(attn_mask_pt == 0, 0.0)
+        batch_size, num_points, d_model = x.shape
 
-        # Reshape mask for multi-head attention: (batch*nhead, L, S)
-        # Actually PyTorch can handle (batch, L, S) in batch_first mode
+        # Convert bool mask to float: True (attend) → 0, False (mask) → -inf
+        # PyTorch MultiheadAttention expects: 0 = attend, -inf = mask
+        attn_mask_float = attention_mask.float()  # (batch, num_points, num_points)
+        attn_mask_float = attn_mask_float.masked_fill(attn_mask_float == 0, float('-inf'))
+
+        # Reshape for multi-head attention: (batch*nhead, num_points, num_points)
+        attn_mask_reshaped = attn_mask_float.repeat_interleave(self.nhead, dim=0)
 
         # Self-attention with local mask
-        attn_out, _ = self.attention(x, x, x, attn_mask=attn_mask_pt)
+        attn_out, _ = self.attention(x, x, x, attn_mask=attn_mask_reshaped)
         x = x + self.dropout(attn_out)
         x = self.norm1(x)
 
