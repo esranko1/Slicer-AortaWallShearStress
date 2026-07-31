@@ -354,7 +354,7 @@ def calculate_rmse(true_vals, pred_vals):
 
 def calculate_r2(true_vals, pred_vals):
     """
-    Calculate R짼 score for each component.
+    Calculate R2 score for each component.
     """
     true_flat = true_vals.reshape(-1, true_vals.shape[-1])
     pred_flat = pred_vals.reshape(-1, pred_vals.shape[-1])
@@ -513,12 +513,12 @@ def evaluate_model(model, test_loader, output_scalers, test_case_file, args, exp
             with open(os.path.join(subset_metrics_all_dir, f'{direction}_{comp}_R2.txt'), 'w') as f_r2:
                 f_r2.write(f"{r2:.3f}")
 
-            logging.info(f"Subset Metrics for {direction} {comp}: MAE={mae:.4f}, RMSE={rmse:.4f}, R짼={r2:.4f}")
+            logging.info(f"Subset Metrics for {direction} {comp}: MAE={mae:.4f}, RMSE={rmse:.4f}, R2={r2:.4f}")
             plot_r2_scatter(true_comp, pred_comp, comp, direction, subset_plots_dir)
 
 def plot_r2_scatter(true_vals, pred_vals, comp, direction, experiment_dir):
     """
-    Plot a scatter plot to visualize the R짼 score for a specific component and direction.
+    Plot a scatter plot to visualize the R2 score for a specific component and direction.
     """
     r2 = r2_score(true_vals, pred_vals)
     plt.figure(figsize=(6,6))
@@ -528,7 +528,7 @@ def plot_r2_scatter(true_vals, pred_vals, comp, direction, experiment_dir):
     plt.plot([min_val, max_val], [min_val, max_val], 'r--', label='Ideal Fit')
     plt.xlabel(f'True {comp}')
     plt.ylabel(f'Predicted {comp}')
-    plt.title(f'{direction.capitalize()} Direction: {comp} Prediction vs True\nR짼 = {r2:.3f}')
+    plt.title(f'{direction.capitalize()} Direction: {comp} Prediction vs True\nR2 = {r2:.3f}')
     plt.legend(loc="upper left")
     plt.tight_layout()
     plt.savefig(os.path.join(experiment_dir, f'{direction}_scatter_{comp}.jpg'), dpi=300)
