@@ -418,6 +418,8 @@ def train_model(model, train_loader, test_loader, args, output_scalers, experime
     
     train_losses, val_losses = [], []
     total_training_time = 0
+    best_val_loss = float('inf')
+    best_epoch = -1
 
     output_labels = list(args.output_components)
     mae_header = ' '.join(f'MAE_{lbl}' for lbl in output_labels)
@@ -476,10 +478,18 @@ def train_model(model, train_loader, test_loader, args, output_scalers, experime
 
         scheduler.step()
 
+        if val_loss_epoch < best_val_loss:
+            best_val_loss = val_loss_epoch
+            best_epoch = epoch + 1
+            torch.save(model.state_dict(), f'{experiment_dir}/model_best.pth')
+
         if (epoch + 1) % 100 == 0:
             torch.save(model.state_dict(), f'{experiment_dir}/model_checkpoint_epoch_{epoch+1}.pth')
 
     torch.save(model.state_dict(), f'{experiment_dir}/model_final.pth')
+    logging.info(f'\nBest epoch: {best_epoch} (val_loss={best_val_loss:.2e})')
+    with open(f'{experiment_dir}/best_epoch.txt', 'w') as f:
+        f.write(f"{best_epoch}\n{best_val_loss}")
 
     total_params = count_parameters(model)
     with open(f'{experiment_dir}/total_params.txt', 'w') as f:
@@ -624,8 +634,8 @@ def main():
 
     plot_loss_curves(train_losses, val_losses, experiment_dir)
     
-    model_final_path = os.path.join(experiment_dir, 'model_final.pth')
-    model.load_state_dict(torch.load(model_final_path, map_location=device))
+    model_best_path = os.path.join(experiment_dir, 'model_best.pth')
+    model.load_state_dict(torch.load(model_best_path, map_location=device))
     model.to(device)
 
     input_training, output_training, input_test, output_test, output_scalers, train_case_file, test_case_file = load_and_preprocess_data(args, experiment_dir)
