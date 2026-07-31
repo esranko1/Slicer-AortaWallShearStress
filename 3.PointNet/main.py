@@ -122,21 +122,12 @@ def process_input(input_components, tmp):
 
 def process_output(output_components, output_vals, identifiers):
     """
-    Select output components and apply direction-specific clipping.
+    Select output components (WSS only, no clipping needed).
     """
-    output_mapping = {'s': 0}
+    output_mapping = {'x': 0}
     selected_indices = [output_mapping[comp] for comp in output_components]
-    combined_output = output_vals[:, :, selected_indices]
-
-    unique_directions = set(id.split('_')[0] for id in identifiers)
-    clipping_ranges_dict = {direction: get_clipping_ranges_for_direction(direction) for direction in unique_directions}
-
-    for direction, clipping_ranges in clipping_ranges_dict.items():
-        indices = [i for i, id in enumerate(identifiers) if id.split('_')[0] == direction]
-        if not indices:
-            continue
-        indices = np.array(indices)
-        for j, idx in enumerate(selected_indices):
+    combined_output = output_vals[:, :, selected_indices].astype(np.float32)
+    return combined_output
             min_val, max_val = clipping_ranges[idx]
             combined_output[indices, :, j] = np.clip(combined_output[indices, :, j], min_val, max_val)
 
