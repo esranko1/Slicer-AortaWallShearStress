@@ -61,15 +61,23 @@ CHECKPOINT_EVERY = 25     # epochs between mid-fold resume checkpoints
 USE_GEOMETRIC_FEATURES = False
 GEOMETRIC_FEATURES_PATH = "../X_with_features.npy"
 
-# Project focus (per PI direction): optimize specifically for the proximal ascending
-# aorta rather than the whole vessel. Points outside the ROI still pass through the
+# Project focus (per PI direction): train one specialist model per aortic region
+# rather than the whole vessel. Points outside the current ROI still pass through the
 # network as geometric context (full 4096-point input is unchanged) — only the loss
-# and best-checkpoint selection are restricted to this region. Columns 0:36 of the
-# 32 (circumferential) x 128 (longitudinal) grid match the existing regional
-# diagnostic breakdown further down (Proximal Ascending).
+# and best-checkpoint selection are restricted to this region. Longitudinal column
+# ranges of the 32 (circumferential) x 128 (longitudinal) grid match the existing
+# regional diagnostic breakdown further down. Switch ROI_NAME to train each region's
+# specialist in turn; each gets its own isolated results dir, so none can collide.
 USE_ROI_LOSS = True
-ROI_LONGITUDINAL_SLICE = slice(0, 36)
-RESULTS_DIR = "../experiments/6_PointNet_Velocity" + ("_geo" if USE_GEOMETRIC_FEATURES else "") + ("_roi_pasc" if USE_ROI_LOSS else "")
+ROI_REGIONS = {
+    "pasc": slice(0, 36),    # Proximal Ascending
+    "arch": slice(36, 60),   # Thoracic Arch
+    "desc": slice(60, 96),   # Descending Aorta
+    "abda": slice(96, 128),  # Abdominal Aorta
+}
+ROI_NAME = "pasc"
+ROI_LONGITUDINAL_SLICE = ROI_REGIONS[ROI_NAME]
+RESULTS_DIR = "../experiments/6_PointNet_Velocity" + ("_geo" if USE_GEOMETRIC_FEATURES else "") + (f"_roi_{ROI_NAME}" if USE_ROI_LOSS else "")
 
 def set_seed(seed=SEED):
     torch.manual_seed(seed)
@@ -478,6 +486,17 @@ def main():
             torch.save(best_state, fold_model_path(fold_idx))
             logging.info(f"Fold {fold_idx}: best_val_loss={best_val_loss:.4f}, R2={fold_r2:.4f} (saved to {results_path})")
 
+        # Whole-vessel R2 above no longer reflects what the model is optimized for once
+        # USE_ROI_LOSS is on — it's expected to look bad/negative since the model isn't
+        # being trained to fit those other regions anymore. This is the number that
+        # actually matters for the current project focus.
+        n_test = true.shape[0]
+        true_roi = true.reshape(n_test, 32, 128)[:, :, ROI_LONGITUDINAL_SLICE]
+        pred_roi = pred.reshape(n_test, 32, 128)[:, :, ROI_LONGITUDINAL_SLICE]
+        fold_r2_roi = calculate_r2(true_roi.flatten(), pred_roi.flatten())
+        logging.info(f"Fold {fold_idx}: {ROI_NAME} ROI R2={fold_r2_roi:.4f} "
+                     f"(whole-vessel R2={fold_r2:.4f}, not the current optimization target)")
+
         fold_r2s.append(fold_r2)
         fold_mses.append(np.mean((true.flatten() - pred.flatten()) ** 2))
         all_true.append(true)
@@ -544,12 +563,17 @@ def main():
     pearson_desc = region_pearson(slice(60, 96))
     pearson_abda = region_pearson(slice(96, 128))
 
+    region_labels = {"pasc": "Proximal Ascending", "arch": "Thoracic Arch",
+                     "desc": "Descending Aorta", "abda": "Abdominal Aorta"}
+    focus_marker = {name: ("  <-- current project focus" if USE_ROI_LOSS and name == ROI_NAME else "")
+                    for name in region_labels}
+
     logging.info(
         "\nPatient-level Pearson by region:\n"
-        f" Proximal Ascending: {pearson_pasc:.3f}  <-- current project focus\n"
-        f" Thoracic Arch: {pearson_arch:.3f}\n"
-        f" Descending Aorta: {pearson_desc:.3f}\n"
-        f" Abdominal Aorta: {pearson_abda:.3f}"
+        f" Proximal Ascending: {pearson_pasc:.3f}{focus_marker['pasc']}\n"
+        f" Thoracic Arch: {pearson_arch:.3f}{focus_marker['arch']}\n"
+        f" Descending Aorta: {pearson_desc:.3f}{focus_marker['desc']}\n"
+        f" Abdominal Aorta: {pearson_abda:.3f}{focus_marker['abda']}"
     )
 
     np.savez_compressed(
