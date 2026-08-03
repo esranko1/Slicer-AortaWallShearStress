@@ -41,6 +41,7 @@ def parse_arguments():
     parser.add_argument('--geometric_features_path', type=str, default='X_with_features.npy', help='Path to pre-computed geometric features')
     parser.add_argument('--fold', type=int, default=None, help='K-fold index (0..n_folds-1). If set, overrides --split_method with a deterministic K-fold split.')
     parser.add_argument('--n_folds', type=int, default=10, help='Number of folds for K-fold cross-validation')
+    parser.add_argument('--ortho_weight', type=float, default=0.001, help='Weight for T-Net orthogonality regularization loss')
     args = parser.parse_args()
     return args
 
@@ -93,7 +94,8 @@ def log_parameters(args, device, name):
     logging.info(f'Input components: {args.input_components}')
     logging.info(f'Output components: {args.output_components}')
     logging.info(f'Scaling factor: {args.scaling}')
-    logging.info(f'Use geometric features: {args.use_geometric_features}\n\n')
+    logging.info(f'Use geometric features: {args.use_geometric_features}')
+    logging.info(f'T-Net orthogonality weight: {args.ortho_weight}\n\n')
 
 def get_clipping_ranges_for_direction(direction):
     """
@@ -293,6 +295,66 @@ def get_num_groups(num_channels, max_groups=32):
             return g
     return 1
 
+class TNet(nn.Module):
+    """
+    Learns a K x K transform matrix from a point cloud / feature set, to align
+    it into a canonical frame before the main network sees it. Final layer is
+    zero-initialized so the transform starts as the identity matrix.
+    """
+    def __init__(self, k, scaling=1.0):
+        super(TNet, self).__init__()
+        self.k = k
+        c64 = int(64 * scaling)
+        c128 = int(128 * scaling)
+        c1024 = int(1024 * scaling)
+
+        self.conv1 = nn.Conv1d(k, c64, 1)
+        self.bn1 = nn.GroupNorm(get_num_groups(c64), c64)
+        self.conv2 = nn.Conv1d(c64, c128, 1)
+        self.bn2 = nn.GroupNorm(get_num_groups(c128), c128)
+        self.conv3 = nn.Conv1d(c128, c1024, 1)
+        self.bn3 = nn.GroupNorm(get_num_groups(c1024), c1024)
+
+        self.fc1 = nn.Linear(c1024, 512)
+        self.bn4 = nn.GroupNorm(get_num_groups(512), 512)
+        self.fc2 = nn.Linear(512, 256)
+        self.bn5 = nn.GroupNorm(get_num_groups(256), 256)
+        self.fc3 = nn.Linear(256, k * k)
+
+        self.activation = nn.ReLU()
+
+        nn.init.zeros_(self.fc3.weight)
+        nn.init.zeros_(self.fc3.bias)
+
+    def forward(self, x):
+        """
+        x: (B, k, N) channel-first point features.
+        Returns: (B, k, k) transform matrix, initialized near identity.
+        """
+        batch_size = x.size(0)
+        x = self.activation(self.bn1(self.conv1(x)))
+        x = self.activation(self.bn2(self.conv2(x)))
+        x = self.activation(self.bn3(self.conv3(x)))
+        x = torch.max(x, dim=2)[0]
+
+        x = self.activation(self.bn4(self.fc1(x)))
+        x = self.activation(self.bn5(self.fc2(x)))
+        x = self.fc3(x)
+
+        identity = torch.eye(self.k, device=x.device, dtype=x.dtype).view(1, self.k * self.k)
+        x = x + identity
+        return x.view(batch_size, self.k, self.k)
+
+def orthogonality_loss(transform_matrix):
+    """
+    Penalizes deviation of a learned T-Net transform from being orthogonal
+    (T @ T^T close to I), as used to regularize PointNet's alignment networks.
+    """
+    k = transform_matrix.size(1)
+    identity = torch.eye(k, device=transform_matrix.device, dtype=transform_matrix.dtype).unsqueeze(0)
+    diff = torch.bmm(transform_matrix, transform_matrix.transpose(1, 2)) - identity
+    return torch.mean(torch.sum(diff ** 2, dim=(1, 2)))
+
 class PointNet(nn.Module):
     """
     PointNet model for point cloud regression tasks.
@@ -309,6 +371,10 @@ class PointNet(nn.Module):
         c512 = int(512 * scaling)
         c1024 = int(1024 * scaling)
         c_local_global = c64 + c1024
+
+        # T-Nets: align raw input coordinates, then align the 64-dim local features
+        self.input_tnet = TNet(input_numbers, scaling)
+        self.feature_tnet = TNet(c64, scaling)
 
         # Shared MLP layers
         self.conv1 = nn.Conv1d(input_numbers, c64, 1)
@@ -343,15 +409,23 @@ class PointNet(nn.Module):
     def forward(self, x):
         """
         Forward pass of the PointNet model.
+        Returns (output, input_transform, feature_transform) so the training
+        loop can apply orthogonality regularization to the T-Nets.
         """
         batch_size = x.size(0)
         x = x.transpose(2, 1)
-        
+
+        input_transform = self.input_tnet(x)
+        x = torch.bmm(input_transform, x)
+
         x = self.activation(self.bn1(self.conv1(x)))
         x = self.activation(self.bn2(self.conv2(x)))
-        
+
+        feature_transform = self.feature_tnet(x)
+        x = torch.bmm(feature_transform, x)
+
         local_feature = x.clone()
-        
+
         x = self.activation(self.bn3(self.conv3(x)))
         x = self.activation(self.bn4(self.conv4(x)))
         x = self.activation(self.bn5(self.conv5(x)))
@@ -368,8 +442,8 @@ class PointNet(nn.Module):
         x = self.activation(self.bn9(self.conv9(x)))
         x = self.sigmoid(self.conv10(x))
         x = x.transpose(2, 1)
-        
-        return x
+
+        return x, input_transform, feature_transform
 
 def define_model(args, N_inputs, device):
     """
@@ -428,11 +502,14 @@ def calculate_pearson_per_patient(true_vals, pred_vals):
 def train_model(model, train_loader, test_loader, args, output_scalers, experiment_dir, device):
     """
     Train the PointNet model and save intermediate checkpoints and metrics.
+    Loss is MAE on the task output plus orthogonality regularization on the
+    T-Nets' learned transform matrices (weighted by --ortho_weight). Reported
+    val_loss is task MAE only, so it stays comparable across runs/checkpoints.
     """
-    criterion = nn.MSELoss()
+    criterion = nn.L1Loss()
     optimizer = optim.Adam(model.parameters(), lr=args.learning_rate)
     scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=1000, gamma=0.5)
-    
+
     train_losses, val_losses = [], []
     total_training_time = 0
     best_val_loss = float('inf')
@@ -451,11 +528,13 @@ def train_model(model, train_loader, test_loader, args, output_scalers, experime
         for inputs, targets in train_loader:
             inputs, targets = inputs.to(device), targets.to(device)
             optimizer.zero_grad()
-            outputs = model(inputs)
-            loss = criterion(outputs, targets)
+            outputs, input_transform, feature_transform = model(inputs)
+            task_loss = criterion(outputs, targets)
+            ortho_loss = orthogonality_loss(input_transform) + orthogonality_loss(feature_transform)
+            loss = task_loss + args.ortho_weight * ortho_loss
             loss.backward()
             optimizer.step()
-            running_loss += loss.item()
+            running_loss += task_loss.item()
 
         train_loss_epoch = running_loss / len(train_loader)
         train_losses.append(train_loss_epoch)
@@ -467,7 +546,7 @@ def train_model(model, train_loader, test_loader, args, output_scalers, experime
         with torch.no_grad():
             for inputs, targets in test_loader:
                 inputs, targets = inputs.to(device), targets.to(device)
-                outputs = model(inputs)
+                outputs, _, _ = model(inputs)
                 loss = criterion(outputs, targets)
                 val_loss += loss.item()
                 all_outputs.append(outputs.cpu().numpy())
@@ -544,7 +623,7 @@ def evaluate_model(model, test_loader, output_scalers, test_case_file, args, exp
     with torch.no_grad():
         for inputs, targets in test_loader:
             inputs, targets = inputs.to(device), targets.to(device)
-            outputs = model(inputs)
+            outputs, _, _ = model(inputs)
             all_outputs.append(outputs.cpu().numpy())
             all_targets.append(targets.cpu().numpy())
 
