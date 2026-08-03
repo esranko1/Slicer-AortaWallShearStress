@@ -29,7 +29,6 @@ from scipy.stats import spearmanr
 logging.basicConfig(level=logging.INFO, format='%(message)s')
 
 DATA_PATH = "../Data/Sampled/Rpt0_N4096.npz"
-RESULTS_DIR = "../experiments/6_PointNet_Velocity"
 NUM_POINTS = 4096
 VELOCITY_DIM = 50
 
@@ -54,6 +53,14 @@ LEARNING_RATE = 1e-4
 GRAD_CLIP_NORM = 1.0      # caps gradient norm, guards against the val-loss spikes seen last run
 SEED = 2024
 CHECKPOINT_EVERY = 25     # epochs between mid-fold resume checkpoints
+
+# Option B: append precomputed surface normals + inlet-distance to the raw xyz input.
+# Kept off by default so RESULTS_DIR stays the proven shape-only baseline; flipping this
+# on writes to a separate _geo results dir so it can never clobber the 0.782 baseline's
+# cached fold results.
+USE_GEOMETRIC_FEATURES = False
+GEOMETRIC_FEATURES_PATH = "../X_with_features.npy"
+RESULTS_DIR = "../experiments/6_PointNet_Velocity" + ("_geo" if USE_GEOMETRIC_FEATURES else "")
 
 def set_seed(seed=SEED):
     torch.manual_seed(seed)
@@ -145,10 +152,10 @@ class TransformationBlock(nn.Module):
 
 
 class AortaPointNetVelocity(nn.Module):
-    def __init__(self, velocity_dim=VELOCITY_DIM):
+    def __init__(self, velocity_dim=VELOCITY_DIM, input_channels=3):
         super().__init__()
-        self.input_transform = TransformationBlock(3)
-        self.conv64 = ConvBlock(3, 64)
+        self.input_transform = TransformationBlock(input_channels)
+        self.conv64 = ConvBlock(input_channels, 64)
         self.conv128_1 = ConvBlock(64, 128)
         self.conv128_2 = ConvBlock(128, 128)
         self.feature_transform = TransformationBlock(128)
@@ -164,8 +171,8 @@ class AortaPointNetVelocity(nn.Module):
         self.pred_act = nn.SiLU()
 
     def forward(self, points, velocity=None):
-        # points: (batch, num_points, 3), velocity: unused (ablation: shape-only)
-        x = points.transpose(1, 2)  # (batch, 3, num_points)
+        # points: (batch, num_points, input_channels), velocity: unused (ablation: shape-only)
+        x = points.transpose(1, 2)  # (batch, input_channels, num_points)
         num_points = x.shape[2]
 
         x_t, matrix1 = self.input_transform(x)
@@ -277,8 +284,8 @@ def concordance_correlation_coefficient(y_true, y_pred):
     return numerator / denominator
 
 
-def train_one_fold(X_train, Y_train, Z_train, X_test, Y_test, Z_test, device, fold_idx):
-    model = AortaPointNetVelocity().to(device)
+def train_one_fold(X_train, Y_train, Z_train, X_test, Y_test, Z_test, device, fold_idx, input_channels=3):
+    model = AortaPointNetVelocity(input_channels=input_channels).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-5)
 
     X_train_t = torch.tensor(X_train, dtype=torch.float32, device=device)
@@ -405,6 +412,13 @@ def main():
     Z = a[:, 0, 3:].astype(np.float32)           # (100, 50)
     Y = b[:, :, 0].astype(np.float32)            # (100, 4096)
 
+    if USE_GEOMETRIC_FEATURES:
+        geo = np.load(GEOMETRIC_FEATURES_PATH)  # (100, 4096, 7): x,y,z,nx,ny,nz,dist
+        geo_feats = geo[:, :, 3:7].astype(np.float32)  # [nx, ny, nz, dist]
+        X = np.concatenate([X, geo_feats], axis=2)  # (100, 4096, 7)
+        logging.info(f"Using geometric features from {GEOMETRIC_FEATURES_PATH}")
+    input_channels = X.shape[-1]
+
     logging.info(f"X: {X.shape}, Z: {Z.shape}, Y: {Y.shape}")
     logging.info(f"Y range: [{Y.min():.4f}, {Y.max():.4f}]")
 
@@ -430,7 +444,7 @@ def main():
             pred_scaled, best_val_loss, best_state = train_one_fold(
                 X[train_ix], Y_scaled[train_ix], Z[train_ix],
                 X[test_ix], Y_scaled[test_ix], Z[test_ix],
-                device, fold_idx
+                device, fold_idx, input_channels=input_channels
             )
             pred = pred_scaled * (y_max - y_min) + y_min
             true = Y[test_ix]
