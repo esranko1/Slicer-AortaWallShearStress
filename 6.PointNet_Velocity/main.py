@@ -60,7 +60,16 @@ CHECKPOINT_EVERY = 25     # epochs between mid-fold resume checkpoints
 # cached fold results.
 USE_GEOMETRIC_FEATURES = False
 GEOMETRIC_FEATURES_PATH = "../X_with_features.npy"
-RESULTS_DIR = "../experiments/6_PointNet_Velocity" + ("_geo" if USE_GEOMETRIC_FEATURES else "")
+
+# Project focus (per PI direction): optimize specifically for the proximal ascending
+# aorta rather than the whole vessel. Points outside the ROI still pass through the
+# network as geometric context (full 4096-point input is unchanged) — only the loss
+# and best-checkpoint selection are restricted to this region. Columns 0:36 of the
+# 32 (circumferential) x 128 (longitudinal) grid match the existing regional
+# diagnostic breakdown further down (Proximal Ascending).
+USE_ROI_LOSS = True
+ROI_LONGITUDINAL_SLICE = slice(0, 36)
+RESULTS_DIR = "../experiments/6_PointNet_Velocity" + ("_geo" if USE_GEOMETRIC_FEATURES else "") + ("_roi_pasc" if USE_ROI_LOSS else "")
 
 def set_seed(seed=SEED):
     torch.manual_seed(seed)
@@ -229,12 +238,24 @@ def orthogonal_regularization(matrix, l2reg=0.01):
     return l2reg * torch.mean(torch.sum((mmt - identity) ** 2, dim=(1, 2)))
 
 
-def compute_loss(pred, target, matrix1, matrix2, data_range=1.0):
+def compute_loss(pred, target, matrix1, matrix2, data_range=1.0, roi_slice=None):
+    """
+    SSIM + MAE + orthogonality regularization, matching the PI's SSIMLoss +
+    OrthogonalRegularizer. When roi_slice is given (a slice over the 128 longitudinal
+    grid columns), MAE and SSIM are computed only over that region — points outside it
+    still pass through the network as geometric context, they just don't contribute
+    to the loss, so training optimizes specifically for the region of interest without
+    discarding the rest of the vessel as model input.
+    """
     batch_size = pred.shape[0]
     pred_grid = pred.reshape(batch_size, 1, 32, 128)
     target_grid = target.reshape(batch_size, 1, 32, 128)
 
-    mae = torch.mean(torch.abs(pred - target))
+    if roi_slice is not None:
+        pred_grid = pred_grid[:, :, :, roi_slice]
+        target_grid = target_grid[:, :, :, roi_slice]
+
+    mae = torch.mean(torch.abs(pred_grid - target_grid))
     ssim_val = compute_ssim(pred_grid, target_grid, data_range=data_range)
     ssim_loss = 2 * mae + 1 - ssim_val
 
@@ -287,6 +308,7 @@ def concordance_correlation_coefficient(y_true, y_pred):
 def train_one_fold(X_train, Y_train, Z_train, X_test, Y_test, Z_test, device, fold_idx, input_channels=3):
     model = AortaPointNetVelocity(input_channels=input_channels).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-5)
+    roi_slice = ROI_LONGITUDINAL_SLICE if USE_ROI_LOSS else None
 
     X_train_t = torch.tensor(X_train, dtype=torch.float32, device=device)
     Y_train_t = torch.tensor(Y_train, dtype=torch.float32, device=device)
@@ -332,7 +354,7 @@ def train_one_fold(X_train, Y_train, Z_train, X_test, Y_test, Z_test, device, fo
             idx = perm[start:start + BATCH_SIZE]
             optimizer.zero_grad()
             pred, m1, m2 = model(X_train_t[idx], Z_train_t[idx])
-            loss = compute_loss(pred, Y_train_t[idx], m1, m2)
+            loss = compute_loss(pred, Y_train_t[idx], m1, m2, roi_slice=roi_slice)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP_NORM)
             optimizer.step()
@@ -343,7 +365,7 @@ def train_one_fold(X_train, Y_train, Z_train, X_test, Y_test, Z_test, device, fo
         model.eval()
         with torch.no_grad():
             val_pred, vm1, vm2 = model(X_test_t, Z_test_t)
-            val_loss = compute_loss(val_pred, Y_test_t, vm1, vm2).item()
+            val_loss = compute_loss(val_pred, Y_test_t, vm1, vm2, roi_slice=roi_slice).item()
 
         if val_loss < best_val_loss:
             best_val_loss = val_loss
@@ -508,9 +530,33 @@ def main():
         f" Abdominal Aorta: {acc_abda:.3f} {pval_abda:.3f}"
     )
 
+    # Region-wise patient-level Pearson (per-patient median within the region, then
+    # correlated across patients) — same regions as the Spearman breakdown above, but
+    # Pearson to match how the whole-vessel number is reported, since the project is
+    # now specifically focused on maximizing the Proximal Ascending region.
+    def region_pearson(col_slice):
+        t = np.median(true_grid[:, :, col_slice].reshape(n_total, -1), axis=1)
+        p = np.median(pred_grid[:, :, col_slice].reshape(n_total, -1), axis=1)
+        return np.corrcoef(t, p)[0, 1]
+
+    pearson_pasc = region_pearson(slice(0, 36))
+    pearson_arch = region_pearson(slice(36, 60))
+    pearson_desc = region_pearson(slice(60, 96))
+    pearson_abda = region_pearson(slice(96, 128))
+
+    logging.info(
+        "\nPatient-level Pearson by region:\n"
+        f" Proximal Ascending: {pearson_pasc:.3f}  <-- current project focus\n"
+        f" Thoracic Arch: {pearson_arch:.3f}\n"
+        f" Descending Aorta: {pearson_desc:.3f}\n"
+        f" Abdominal Aorta: {pearson_abda:.3f}"
+    )
+
     np.savez_compressed(
         os.path.join(RESULTS_DIR, "results.npz"),
         all_true=all_true, all_pred=all_pred, fold_r2s=fold_r2s, fold_mses=fold_mses,
+        pearson_pasc=pearson_pasc, pearson_arch=pearson_arch,
+        pearson_desc=pearson_desc, pearson_abda=pearson_abda,
     )
     logging.info(f"\nSaved results to {RESULTS_DIR}/results.npz")
 
