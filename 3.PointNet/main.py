@@ -283,6 +283,16 @@ def create_dataloaders(input_training, output_training, input_test, output_test,
 
     return train_loader, test_loader
 
+def get_num_groups(num_channels, max_groups=32):
+    """
+    Largest group count <= max_groups that evenly divides num_channels,
+    for GroupNorm on scaled channel counts that aren't powers of 2.
+    """
+    for g in range(min(max_groups, num_channels), 0, -1):
+        if num_channels % g == 0:
+            return g
+    return 1
+
 class PointNet(nn.Module):
     """
     PointNet model for point cloud regression tasks.
@@ -292,35 +302,42 @@ class PointNet(nn.Module):
         self.scaling = scaling
         self.point_numbers = point_numbers
         self.targets_numbers = targets_numbers
-        
+
+        c64 = int(64 * scaling)
+        c128 = int(128 * scaling)
+        c256 = int(256 * scaling)
+        c512 = int(512 * scaling)
+        c1024 = int(1024 * scaling)
+        c_local_global = c64 + c1024
+
         # Shared MLP layers
-        self.conv1 = nn.Conv1d(input_numbers, int(64 * scaling), 1)
-        self.bn1 = nn.BatchNorm1d(int(64 * scaling))
-        self.conv2 = nn.Conv1d(int(64 * scaling), int(64 * scaling), 1)
-        self.bn2 = nn.BatchNorm1d(int(64 * scaling))
+        self.conv1 = nn.Conv1d(input_numbers, c64, 1)
+        self.bn1 = nn.GroupNorm(get_num_groups(c64), c64)
+        self.conv2 = nn.Conv1d(c64, c64, 1)
+        self.bn2 = nn.GroupNorm(get_num_groups(c64), c64)
         self.activation = nn.ReLU()
-        
-        self.conv3 = nn.Conv1d(int(64 * scaling), int(64 * scaling), 1)
-        self.bn3 = nn.BatchNorm1d(int(64 * scaling))
-        self.conv4 = nn.Conv1d(int(64 * scaling), int(128 * scaling), 1)
-        self.bn4 = nn.BatchNorm1d(int(128 * scaling))
-        self.conv5 = nn.Conv1d(int(128 * scaling), int(1024 * scaling), 1)
-        self.bn5 = nn.BatchNorm1d(int(1024 * scaling))
-        
+
+        self.conv3 = nn.Conv1d(c64, c64, 1)
+        self.bn3 = nn.GroupNorm(get_num_groups(c64), c64)
+        self.conv4 = nn.Conv1d(c64, c128, 1)
+        self.bn4 = nn.GroupNorm(get_num_groups(c128), c128)
+        self.conv5 = nn.Conv1d(c128, c1024, 1)
+        self.bn5 = nn.GroupNorm(get_num_groups(c1024), c1024)
+
         self.maxpool = nn.MaxPool1d(self.point_numbers)
-        
+
         # Layers after combining local and global features
-        self.conv6 = nn.Conv1d(int(64 * scaling) + int(1024 * scaling), int(512 * scaling), 1)
-        self.bn6 = nn.BatchNorm1d(int(512 * scaling))
-        self.conv7 = nn.Conv1d(int(512 * scaling), int(256 * scaling), 1)
-        self.bn7 = nn.BatchNorm1d(int(256 * scaling))
-        self.conv8 = nn.Conv1d(int(256 * scaling), int(128 * scaling), 1)
-        self.bn8 = nn.BatchNorm1d(int(128 * scaling))
-        
-        self.conv9 = nn.Conv1d(int(128 * scaling), int(128 * scaling), 1)
-        self.bn9 = nn.BatchNorm1d(int(128 * scaling))
-        self.conv10 = nn.Conv1d(int(128 * scaling), self.targets_numbers, 1)
-        
+        self.conv6 = nn.Conv1d(c_local_global, c512, 1)
+        self.bn6 = nn.GroupNorm(get_num_groups(c512), c512)
+        self.conv7 = nn.Conv1d(c512, c256, 1)
+        self.bn7 = nn.GroupNorm(get_num_groups(c256), c256)
+        self.conv8 = nn.Conv1d(c256, c128, 1)
+        self.bn8 = nn.GroupNorm(get_num_groups(c128), c128)
+
+        self.conv9 = nn.Conv1d(c128, c128, 1)
+        self.bn9 = nn.GroupNorm(get_num_groups(c128), c128)
+        self.conv10 = nn.Conv1d(c128, self.targets_numbers, 1)
+
         self.sigmoid = nn.Sigmoid()
 
     def forward(self, x):
