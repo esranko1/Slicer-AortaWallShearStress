@@ -30,7 +30,16 @@ def concordance_correlation_coefficient(y_true, y_pred):
     return numerator / denominator
 
 
-def main():
+def build_composite(verbose=True):
+    """
+    Loads all four specialists' results.npz, verifies they share the same fold split,
+    and stitches them into one composite full-vessel prediction. Every row in the
+    returned arrays is a genuine held-out prediction (from whichever fold had that
+    patient in its test set), pooled in KFold's iteration order — the same order
+    reproducible via KFold(n_splits=N_FOLDS, shuffle=True, random_state=SEED).split().
+
+    Returns: (all_true, composite_pred) — each (n_total, 4096).
+    """
     data = {name: np.load(path) for name, (_, path) in REGIONS.items()}
 
     all_true = data["pasc"]["all_true"]
@@ -43,7 +52,8 @@ def main():
                 f"stitching would mix predictions from different train/test partitions. "
                 f"Check that all four runs used the same SEED/N_FOLDS/X (USE_GEOMETRIC_FEATURES off)."
             )
-    print(f"Fold-split consistency check passed across all 4 regions (N={n_total} patients).")
+    if verbose:
+        print(f"Fold-split consistency check passed across all 4 regions (N={n_total} patients).")
 
     true_grid = all_true.reshape(n_total, 32, 128)
     composite_pred_grid = np.zeros_like(true_grid)
@@ -53,9 +63,16 @@ def main():
         composite_pred_grid[:, :, col_slice] = pred_grid[:, :, col_slice]
 
     composite_pred = composite_pred_grid.reshape(n_total, -1)
-    all_true_flat = true_grid.reshape(n_total, -1)
+    return all_true, composite_pred
 
-    patient_true = np.median(all_true_flat, axis=1)
+
+def main():
+    all_true, composite_pred = build_composite()
+    n_total = all_true.shape[0]
+    true_grid = all_true.reshape(n_total, 32, 128)
+    composite_pred_grid = composite_pred.reshape(n_total, 32, 128)
+
+    patient_true = np.median(all_true, axis=1)
     patient_pred = np.median(composite_pred, axis=1)
     pearson_r = np.corrcoef(patient_true, patient_pred)[0, 1]
     spearman_r, spearman_p = spearmanr(patient_true, patient_pred)
