@@ -77,7 +77,27 @@ ROI_REGIONS = {
 }
 ROI_NAME = "pasc"
 ROI_LONGITUDINAL_SLICE = ROI_REGIONS[ROI_NAME]
-RESULTS_DIR = "../experiments/6_PointNet_Velocity" + ("_geo" if USE_GEOMETRIC_FEATURES else "") + (f"_roi_{ROI_NAME}" if USE_ROI_LOSS else "")
+
+# Cascade experiment: condition the current region's model on an upstream region's own
+# specialist predictions (e.g. train Thoracic Arch with a hint of what Proximal
+# Ascending predicted). Physically motivated — WSS downstream depends on flow arriving
+# from upstream — but conditions on the upstream specialist's genuinely held-out
+# (K-fold out-of-fold) predictions, never its ground truth: at inference on a new
+# patient you'd only ever have the upstream model's *prediction*, never the true value,
+# so training must match that or the model would learn to rely on a signal it won't
+# have in deployment.
+USE_UPSTREAM_CONDITIONING = False
+UPSTREAM_REGION = "pasc"
+UPSTREAM_RESULTS_PATH = f"../experiments/6_PointNet_Velocity_roi_{UPSTREAM_REGION}/results.npz"
+UPSTREAM_BOUNDARY_COL = 35  # last column of pasc's ROI (0:36) — immediately upstream of arch's start (36:60)
+
+if USE_UPSTREAM_CONDITIONING:
+    assert ROI_NAME != UPSTREAM_REGION, "Upstream conditioning region must differ from the region being trained"
+
+RESULTS_DIR = ("../experiments/6_PointNet_Velocity"
+               + ("_geo" if USE_GEOMETRIC_FEATURES else "")
+               + (f"_roi_{ROI_NAME}" if USE_ROI_LOSS else "")
+               + (f"_upstream_{UPSTREAM_REGION}" if USE_UPSTREAM_CONDITIONING else ""))
 
 def set_seed(seed=SEED):
     torch.manual_seed(seed)
@@ -418,6 +438,43 @@ def train_one_fold(X_train, Y_train, Z_train, X_test, Y_test, Z_test, device, fo
     return final_pred.cpu().numpy(), best_val_loss, best_state
 
 
+def _build_upstream_channel(n_total, y_min, y_max):
+    """
+    Builds a per-point conditioning channel from an upstream specialist's genuinely
+    held-out (K-fold out-of-fold) predictions, reordered from results.npz's pooled
+    fold-iteration order back into original patient-index order by replicating the
+    identical KFold split (same SEED/N_FOLDS/n_total) that specialist was trained
+    with — this only produces a valid channel if UPSTREAM_RESULTS_PATH's run used the
+    same data and split as the current one.
+
+    Takes the upstream region's boundary column (one predicted WSS value per
+    circumferential row) and broadcasts it across all 128 longitudinal columns, scaled
+    the same way as Y_scaled — so it's a per-row "what was predicted just upstream"
+    hint, constant along the column axis, not a full field.
+
+    Returns: (n_total, 4096) float32 array.
+    """
+    upstream = np.load(UPSTREAM_RESULTS_PATH)
+    upstream_pred_pooled = upstream["all_pred"]  # (n_total, 4096), pooled KFold order
+
+    kf_upstream = KFold(n_splits=N_FOLDS, shuffle=True, random_state=SEED)
+    pooled_to_original = []
+    for _, test_ix in kf_upstream.split(np.arange(n_total)):
+        pooled_to_original.extend(test_ix.tolist())
+
+    original_to_pooled = np.empty(n_total, dtype=int)
+    for pooled_idx, orig_idx in enumerate(pooled_to_original):
+        original_to_pooled[orig_idx] = pooled_idx
+    upstream_pred_orig = upstream_pred_pooled[original_to_pooled]
+
+    upstream_grid = upstream_pred_orig.reshape(n_total, 32, 128)
+    boundary = upstream_grid[:, :, UPSTREAM_BOUNDARY_COL]  # (n_total, 32)
+    boundary_scaled = (boundary - y_min) / (y_max - y_min)
+
+    channel = np.repeat(boundary_scaled[:, :, None], 128, axis=2).reshape(n_total, -1)
+    return channel.astype(np.float32)
+
+
 # ---------------------------------------------------------------------------
 # Main — 10-fold CV, matching the PI's original evaluation methodology.
 # ---------------------------------------------------------------------------
@@ -442,19 +499,28 @@ def main():
     Z = a[:, 0, 3:].astype(np.float32)           # (100, 50)
     Y = b[:, :, 0].astype(np.float32)            # (100, 4096)
 
+    # Scale Y to [0, 1] for training stability; inverse-transform for reporting. Computed
+    # early since USE_UPSTREAM_CONDITIONING below needs y_min/y_max to scale its channel
+    # consistently with Y_scaled.
+    y_min, y_max = Y.min(), Y.max()
+    Y_scaled = (Y - y_min) / (y_max - y_min)
+
     if USE_GEOMETRIC_FEATURES:
         geo = np.load(GEOMETRIC_FEATURES_PATH)  # (100, 4096, 7): x,y,z,nx,ny,nz,dist
         geo_feats = geo[:, :, 3:7].astype(np.float32)  # [nx, ny, nz, dist]
         X = np.concatenate([X, geo_feats], axis=2)  # (100, 4096, 7)
         logging.info(f"Using geometric features from {GEOMETRIC_FEATURES_PATH}")
+
+    if USE_UPSTREAM_CONDITIONING:
+        upstream_channel = _build_upstream_channel(X.shape[0], y_min, y_max)
+        X = np.concatenate([X, upstream_channel[:, :, None]], axis=2)
+        logging.info(f"Using upstream conditioning from {UPSTREAM_RESULTS_PATH} "
+                     f"(region={UPSTREAM_REGION}, boundary_col={UPSTREAM_BOUNDARY_COL})")
+
     input_channels = X.shape[-1]
 
     logging.info(f"X: {X.shape}, Z: {Z.shape}, Y: {Y.shape}")
     logging.info(f"Y range: [{Y.min():.4f}, {Y.max():.4f}]")
-
-    # Scale Y to [0, 1] for training stability; inverse-transform for reporting.
-    y_min, y_max = Y.min(), Y.max()
-    Y_scaled = (Y - y_min) / (y_max - y_min)
 
     kf = KFold(n_splits=N_FOLDS, shuffle=True, random_state=SEED)
 
