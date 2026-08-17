@@ -19,7 +19,12 @@ import numpy as np
 from check_significance import bootstrap_pearson_diff, report
 
 ARCH_PLAIN_PATH = "../experiments/6_PointNet_Velocity_roi_arch/results.npz"
-ARCH_CONDITIONED_PATH = "../experiments/6_PointNet_Velocity_roi_arch_upstream_pasc/results.npz"
+CONDITIONING_MODE = "rich"  # "boundary" (already tested) or "rich" (new)
+ARCH_CONDITIONED_PATH = (
+    "../experiments/6_PointNet_Velocity_roi_arch_upstream_pasc"
+    + ("" if CONDITIONING_MODE == "boundary" else f"_{CONDITIONING_MODE}")
+    + "/results.npz"
+)
 ARCH_COL_SLICE = slice(36, 60)
 
 
