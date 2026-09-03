@@ -37,7 +37,7 @@ VELOCITY_DIM = 50
 # non-negativity) trains stably and looks directionally promising before committing to
 # the full run's wall-clock cost. Fold filenames encode N_FOLDS, so quick-test and
 # full-run results never collide on disk.
-QUICK_TEST = False
+QUICK_TEST = True
 
 if QUICK_TEST:
     N_FOLDS = 3
@@ -75,7 +75,7 @@ ROI_REGIONS = {
     "desc": slice(60, 96),   # Descending Aorta
     "abda": slice(96, 128),  # Abdominal Aorta
 }
-ROI_NAME = "pasc"
+ROI_NAME = "arch"
 ROI_LONGITUDINAL_SLICE = ROI_REGIONS[ROI_NAME]
 
 # Cascade experiment: condition the current region's model on an upstream region's own
@@ -86,7 +86,7 @@ ROI_LONGITUDINAL_SLICE = ROI_REGIONS[ROI_NAME]
 # patient you'd only ever have the upstream model's *prediction*, never the true value,
 # so training must match that or the model would learn to rely on a signal it won't
 # have in deployment.
-USE_UPSTREAM_CONDITIONING = False
+USE_UPSTREAM_CONDITIONING = True
 UPSTREAM_REGION = "pasc"
 UPSTREAM_RESULTS_PATH = f"../experiments/6_PointNet_Velocity_roi_{UPSTREAM_REGION}/results.npz"
 UPSTREAM_BOUNDARY_COL = 35  # last column of pasc's ROI (0:36) — immediately upstream of arch's start (36:60)
