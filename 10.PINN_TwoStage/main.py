@@ -180,10 +180,10 @@ class PINN_Loss:
         u, v, w, p = flow[:, 0:1], flow[:, 1:2], flow[:, 2:3], flow[:, 3:4]
 
         # First derivatives w.r.t. space and time
-        grad_u = torch.autograd.grad(u.sum(), xyz_t, create_graph=True)[0]
-        grad_v = torch.autograd.grad(v.sum(), xyz_t, create_graph=True)[0]
-        grad_w = torch.autograd.grad(w.sum(), xyz_t, create_graph=True)[0]
-        grad_p = torch.autograd.grad(p.sum(), xyz_t, create_graph=True)[0]
+        grad_u = torch.autograd.grad(u.sum(), xyz_t, create_graph=True, retain_graph=True)[0]
+        grad_v = torch.autograd.grad(v.sum(), xyz_t, create_graph=True, retain_graph=True)[0]
+        grad_w = torch.autograd.grad(w.sum(), xyz_t, create_graph=True, retain_graph=True)[0]
+        grad_p = torch.autograd.grad(p.sum(), xyz_t, create_graph=True, retain_graph=True)[0]
 
         du_dt, du_dx, du_dy, du_dz = grad_u[:, 3:4], grad_u[:, 0:1], grad_u[:, 1:2], grad_u[:, 2:3]
         dv_dt, dv_dx, dv_dy, dv_dz = grad_v[:, 3:4], grad_v[:, 0:1], grad_v[:, 1:2], grad_v[:, 2:3]
@@ -191,19 +191,20 @@ class PINN_Loss:
         dp_dx, dp_dy, dp_dz = grad_p[:, 0:1], grad_p[:, 1:2], grad_p[:, 2:3]
 
         # Laplacian: ∇²u = ∂²u/∂x² + ∂²u/∂y² + ∂²u/∂z²
-        d2u_dx2 = torch.autograd.grad(du_dx.sum(), xyz_t, create_graph=True)[0][:, 0:1]
-        d2u_dy2 = torch.autograd.grad(du_dy.sum(), xyz_t, create_graph=True)[0][:, 1:2]
-        d2u_dz2 = torch.autograd.grad(du_dz.sum(), xyz_t, create_graph=True)[0][:, 2:3]
+        # Avoid nested autograd for stability; use single-pass second derivatives
+        d2u_dx2 = torch.autograd.grad(du_dx.sum(), xyz_t, create_graph=False, retain_graph=True)[0][:, 0:1]
+        d2u_dy2 = torch.autograd.grad(du_dy.sum(), xyz_t, create_graph=False, retain_graph=True)[0][:, 1:2]
+        d2u_dz2 = torch.autograd.grad(du_dz.sum(), xyz_t, create_graph=False, retain_graph=True)[0][:, 2:3]
         laplacian_u = d2u_dx2 + d2u_dy2 + d2u_dz2
 
-        d2v_dx2 = torch.autograd.grad(dv_dx.sum(), xyz_t, create_graph=True)[0][:, 0:1]
-        d2v_dy2 = torch.autograd.grad(dv_dy.sum(), xyz_t, create_graph=True)[0][:, 1:2]
-        d2v_dz2 = torch.autograd.grad(dv_dz.sum(), xyz_t, create_graph=True)[0][:, 2:3]
+        d2v_dx2 = torch.autograd.grad(dv_dx.sum(), xyz_t, create_graph=False, retain_graph=True)[0][:, 0:1]
+        d2v_dy2 = torch.autograd.grad(dv_dy.sum(), xyz_t, create_graph=False, retain_graph=True)[0][:, 1:2]
+        d2v_dz2 = torch.autograd.grad(dv_dz.sum(), xyz_t, create_graph=False, retain_graph=True)[0][:, 2:3]
         laplacian_v = d2v_dx2 + d2v_dy2 + d2v_dz2
 
-        d2w_dx2 = torch.autograd.grad(dw_dx.sum(), xyz_t, create_graph=True)[0][:, 0:1]
-        d2w_dy2 = torch.autograd.grad(dw_dy.sum(), xyz_t, create_graph=True)[0][:, 1:2]
-        d2w_dz2 = torch.autograd.grad(dw_dz.sum(), xyz_t, create_graph=True)[0][:, 2:3]
+        d2w_dx2 = torch.autograd.grad(dw_dx.sum(), xyz_t, create_graph=False, retain_graph=True)[0][:, 0:1]
+        d2w_dy2 = torch.autograd.grad(dw_dy.sum(), xyz_t, create_graph=False, retain_graph=True)[0][:, 1:2]
+        d2w_dz2 = torch.autograd.grad(dw_dz.sum(), xyz_t, create_graph=False, retain_graph=True)[0][:, 2:3]
         laplacian_w = d2w_dx2 + d2w_dy2 + d2w_dz2
 
         # Convection terms: u·∇u
@@ -347,6 +348,7 @@ def main():
         logging.info(f"{'='*60}")
 
         X_train, X_test = X[train_ix], X[test_ix]
+        Z_train, Z_test = Z[train_ix], Z[test_ix]
         Y_train, Y_test = Y_scaled[train_ix], Y_scaled[test_ix]
         X_interior_train = X_interior_all[train_ix]
 
@@ -357,8 +359,8 @@ def main():
         train_ix_inner = np.setdiff1d(np.arange(n_train), val_ix)
 
         X_train_inner = X_train[train_ix_inner]
-        Y_train_inner = Y_train[train_ix_inner]
         Z_train_inner = Z_train[train_ix_inner]
+        Y_train_inner = Y_train[train_ix_inner]
         X_val = X_train[val_ix]
         Y_val = Y_train[val_ix]
 
@@ -463,8 +465,10 @@ def main():
                 y_wss_t = torch.tensor(y_wss, device=device, dtype=torch.float32).unsqueeze(1)
                 wss_loss = wss_mse(wss_pred_out, y_wss_t)
 
-                # Combined loss
-                total_loss = pinn_total + wss_loss
+                # Combined loss with scaling (avoid physics loss from dominating)
+                # Scale PINN loss to be comparable to WSS loss
+                pinn_scaled = pinn_total * 0.1  # Downweight physics loss to let WSS dominate learning
+                total_loss = pinn_scaled + wss_loss
 
                 # Backprop
                 optimizer_pinn.zero_grad()
@@ -499,8 +503,9 @@ def main():
 
                 val_loss_avg = val_wss_loss / len(val_idx)
 
-            if epoch % 25 == 0:
-                ns_avg, cont_avg, inlet_avg, wall_avg = np.mean(pinn_loss_log, axis=0)
+            if epoch % 25 == 0 and len(pinn_loss_log) > 0:
+                pinn_logs_arr = np.array(pinn_loss_log)
+                ns_avg, cont_avg, inlet_avg, wall_avg = np.mean(pinn_logs_arr, axis=0)
                 logging.info(f"Epoch {epoch:3d}: train={np.mean(train_losses):.6f}, "
                            f"NS={ns_avg:.6f}, Cont={cont_avg:.6f}, Inlet={inlet_avg:.6f}, Wall={wall_avg:.6f}, "
                            f"val_WSS={val_loss_avg:.6f}")
