@@ -405,6 +405,28 @@ def main():
 
     n_patients = X.shape[0]
 
+    # Center each patient at their own centroid (raw scanner coordinates
+    # carry an arbitrary absolute offset that doesn't generalize across
+    # patients) and scale everyone by ONE global constant (median patient
+    # extent) so coordinates land in a roughly O(1) range - required for
+    # the Fourier-feature positional encoding (sin/cos of raw, unscaled
+    # coordinates aliases into near-noise) while still preserving genuine
+    # cross-patient size differences, which correlate with WSS.
+    X_centroids = X.mean(axis=1, keepdims=True)  # (n_patients, 1, 3)
+    X_centered = X - X_centroids
+    patient_extent = np.linalg.norm(X_centered, axis=2).max(axis=1)  # (n_patients,)
+    coord_scale = np.median(patient_extent) + 1e-8
+    X = (X_centered / coord_scale).astype(np.float32)
+    logging.info(f"Coordinates centered per-patient, scaled by global median extent={coord_scale:.4f}")
+
+    # Normalize the inlet velocity waveform to O(1) too: raw Z drove the
+    # Poiseuille supervision target (Flow loss) into the hundreds while
+    # Wall/Cont/NS losses sat around 0.01-1, so it dominated and
+    # destabilized the shared PINN's training.
+    z_scale = np.max(np.abs(Z)) + 1e-8
+    Z = Z / z_scale
+    logging.info(f"Z waveform normalized by scale={z_scale:.4f}")
+
     # Compute normals, flow geometry, and interior lumen points per patient
     logging.info("Computing surface normals, flow geometry, and interior points...")
     normals = np.zeros_like(X)
