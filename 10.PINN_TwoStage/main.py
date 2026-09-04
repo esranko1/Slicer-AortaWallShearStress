@@ -113,18 +113,25 @@ def get_device():
 
 class PINN_FlowSolver(nn.Module):
     """
-    Physics-Informed Neural Network for Navier-Stokes.
+    Physics-Informed Neural Network for Navier-Stokes with Fourier features.
     Outputs: u(x,y,z,t), v, w, p = flow field
     """
 
-    def __init__(self, hidden_dim=128, num_layers=4):
+    def __init__(self, hidden_dim=128, num_layers=4, fourier_features=32):
         super().__init__()
 
-        # Input: (x, y, z, t) = 4 dims
-        # Output: (u, v, w, p) = 4 dims
+        self.fourier_features = fourier_features
+        # Fourier feature matrix for positional encoding
+        self.register_buffer(
+            'fourier_matrix',
+            torch.randn(4, fourier_features) * np.pi
+        )
+
+        # Input: 4 (xyz,t) + 2*fourier_features (sin/cos of Fourier features)
+        input_dim = 4 + 2 * fourier_features
 
         layers = []
-        layers.append(nn.Linear(4, hidden_dim))
+        layers.append(nn.Linear(input_dim, hidden_dim))
         layers.append(nn.Tanh())
 
         for _ in range(num_layers - 1):
@@ -140,12 +147,20 @@ class PINN_FlowSolver(nn.Module):
         x: (batch, 4) = [x, y, z, t]
         returns: (batch, 4) = [u, v, w, p]
         """
-        return self.network(x)
+        # Fourier feature encoding
+        fourier_x = x @ self.fourier_matrix  # (batch, fourier_features)
+        fourier_feat = torch.cat([
+            torch.sin(fourier_x),
+            torch.cos(fourier_x)
+        ], dim=1)  # (batch, 2*fourier_features)
+
+        x_encoded = torch.cat([x, fourier_feat], dim=1)
+        return self.network(x_encoded)
 
 
 class PINN_Loss:
     """
-    Compute physics-informed loss (Navier-Stokes equations).
+    Full Navier-Stokes loss with second derivatives for viscous term ∇²u.
     """
 
     def __init__(self, model, device, rho=1.0, mu=0.001):
@@ -154,76 +169,90 @@ class PINN_Loss:
         self.rho = rho
         self.mu = mu
 
-    def compute_derivatives(self, xyz_t):
+    def navier_stokes_loss(self, xyz_t):
         """
-        Compute derivatives of flow w.r.t. space and time.
+        Enforce full Navier-Stokes: ρ(∂u/∂t + u·∇u) + ∇p - μ∇²u = 0
+        Computes residual at interior points.
         xyz_t: (batch, 4) = [x, y, z, t], requires_grad=True
-        returns: (u,v,w,p), and their derivatives
         """
         xyz_t.requires_grad_(True)
-        flow = self.model(xyz_t)  # (batch, 4)
+        flow = self.model(xyz_t)
         u, v, w, p = flow[:, 0:1], flow[:, 1:2], flow[:, 2:3], flow[:, 3:4]
 
-        # Compute gradients via autograd
-        # ∂u/∂t, ∂u/∂x, ∂u/∂y, ∂u/∂z
+        # First derivatives w.r.t. space and time
         grad_u = torch.autograd.grad(u.sum(), xyz_t, create_graph=True)[0]
         grad_v = torch.autograd.grad(v.sum(), xyz_t, create_graph=True)[0]
         grad_w = torch.autograd.grad(w.sum(), xyz_t, create_graph=True)[0]
         grad_p = torch.autograd.grad(p.sum(), xyz_t, create_graph=True)[0]
 
-        return u, v, w, p, grad_u, grad_v, grad_w, grad_p
+        du_dt, du_dx, du_dy, du_dz = grad_u[:, 3:4], grad_u[:, 0:1], grad_u[:, 1:2], grad_u[:, 2:3]
+        dv_dt, dv_dx, dv_dy, dv_dz = grad_v[:, 3:4], grad_v[:, 0:1], grad_v[:, 1:2], grad_v[:, 2:3]
+        dw_dt, dw_dx, dw_dy, dw_dz = grad_w[:, 3:4], grad_w[:, 0:1], grad_w[:, 1:2], grad_w[:, 2:3]
+        dp_dx, dp_dy, dp_dz = grad_p[:, 0:1], grad_p[:, 1:2], grad_p[:, 2:3]
 
-    def continuity_loss(self, xyz_t):
-        """∇·u = 0 (mass conservation)"""
-        xyz_t.requires_grad_(True)
-        flow = self.model(xyz_t)
-        u = flow[:, 0:1]
+        # Laplacian: ∇²u = ∂²u/∂x² + ∂²u/∂y² + ∂²u/∂z²
+        d2u_dx2 = torch.autograd.grad(du_dx.sum(), xyz_t, create_graph=True)[0][:, 0:1]
+        d2u_dy2 = torch.autograd.grad(du_dy.sum(), xyz_t, create_graph=True)[0][:, 1:2]
+        d2u_dz2 = torch.autograd.grad(du_dz.sum(), xyz_t, create_graph=True)[0][:, 2:3]
+        laplacian_u = d2u_dx2 + d2u_dy2 + d2u_dz2
 
-        grad_u = torch.autograd.grad(u.sum(), xyz_t, create_graph=True)[0]
-        du_dx = grad_u[:, 0:1]  # ∂u/∂x
+        d2v_dx2 = torch.autograd.grad(dv_dx.sum(), xyz_t, create_graph=True)[0][:, 0:1]
+        d2v_dy2 = torch.autograd.grad(dv_dy.sum(), xyz_t, create_graph=True)[0][:, 1:2]
+        d2v_dz2 = torch.autograd.grad(dv_dz.sum(), xyz_t, create_graph=True)[0][:, 2:3]
+        laplacian_v = d2v_dx2 + d2v_dy2 + d2v_dz2
 
-        # For simplicity: ∂u/∂x + ∂v/∂y + ∂w/∂z ≈ 0
-        # (Full version needs all 3, but start simple)
-        return torch.mean(du_dx ** 2)
+        d2w_dx2 = torch.autograd.grad(dw_dx.sum(), xyz_t, create_graph=True)[0][:, 0:1]
+        d2w_dy2 = torch.autograd.grad(dw_dy.sum(), xyz_t, create_graph=True)[0][:, 1:2]
+        d2w_dz2 = torch.autograd.grad(dw_dz.sum(), xyz_t, create_graph=True)[0][:, 2:3]
+        laplacian_w = d2w_dx2 + d2w_dy2 + d2w_dz2
 
-    def momentum_loss(self, xyz_t):
-        """ρ(∂u/∂t + u·∇u) = -∇p + μ∇²u"""
-        # Simplified: just penalize large accelerations without full PDE
-        # Full PDE requires second derivatives (∇²u) which are expensive
-        xyz_t.requires_grad_(True)
-        flow = self.model(xyz_t)
-        u, v, w, p = flow[:, 0:1], flow[:, 1:2], flow[:, 2:3], flow[:, 3:4]
+        # Convection terms: u·∇u
+        convection_u = u * du_dx + v * du_dy + w * du_dz
+        convection_v = u * dv_dx + v * dv_dy + w * dv_dz
+        convection_w = u * dw_dx + v * dw_dy + w * dw_dz
 
-        # Penalize large velocities (regularization)
-        velocity_mag = torch.sqrt(u**2 + v**2 + w**2 + 1e-6)
-        return torch.mean(velocity_mag ** 2)
+        # Momentum residuals
+        momentum_u = self.rho * (du_dt + convection_u) + dp_dx - self.mu * laplacian_u
+        momentum_v = self.rho * (dv_dt + convection_v) + dp_dy - self.mu * laplacian_v
+        momentum_w = self.rho * (dw_dt + convection_w) + dp_dz - self.mu * laplacian_w
 
-    def total_loss(self, xyz_t, bc_inlet=None, bc_wall=None):
+        # Continuity residual: ∇·u = ∂u/∂x + ∂v/∂y + ∂w/∂z
+        continuity = du_dx + dv_dy + dw_dz
+
+        # L2 norm of residuals
+        ns_loss = torch.mean(momentum_u**2 + momentum_v**2 + momentum_w**2)
+        cont_loss = torch.mean(continuity**2)
+
+        return ns_loss, cont_loss
+
+    def total_loss(self, xyz_interior, xyz_inlet, u_inlet_target, xyz_wall):
         """
-        Total physics-informed loss.
-        xyz_t: interior points (batch, 4)
-        bc_inlet: inlet boundary points with velocity BC
-        bc_wall: wall boundary points (should have u=0)
+        Total physics-informed loss with boundary conditions.
+        xyz_interior: (batch, 4) interior points
+        xyz_inlet: (batch, 4) inlet boundary points
+        u_inlet_target: (batch, 1) inlet velocity BC value
+        xyz_wall: (batch, 4) wall boundary points
         """
-        loss = 0.0
+        # PDE residuals at interior
+        ns_loss, cont_loss = self.navier_stokes_loss(xyz_interior)
 
-        # PDE enforcement at interior points
-        loss += W_CONTINUITY * self.continuity_loss(xyz_t)
-        loss += W_MOMENTUM * self.momentum_loss(xyz_t)
+        # Inlet boundary condition: u_normal = Z(t)
+        flow_inlet = self.model(xyz_inlet)
+        u_inlet_pred = flow_inlet[:, 0:1]  # Normal component
+        inlet_loss = torch.mean((u_inlet_pred - u_inlet_target)**2)
 
-        # Boundary conditions
-        if bc_inlet is not None:
-            flow_inlet = self.model(bc_inlet['xyz_t'])
-            u_inlet_pred = flow_inlet[:, 0:1]
-            u_inlet_true = bc_inlet['u_inlet']
-            loss += W_INLET_BC * torch.mean((u_inlet_pred - u_inlet_true) ** 2)
+        # Wall boundary condition: u = 0 (no-slip)
+        flow_wall = self.model(xyz_wall)
+        u_wall = flow_wall[:, 0:3]  # u, v, w
+        wall_loss = torch.mean(u_wall**2)
 
-        if bc_wall is not None:
-            flow_wall = self.model(bc_wall)
-            u_wall = flow_wall[:, 0:3]  # u, v, w
-            loss += W_WALL_BC * torch.mean(u_wall ** 2)  # Should be ~0
+        # Total loss
+        total = (W_CONTINUITY * cont_loss +
+                 W_MOMENTUM * ns_loss +
+                 W_INLET_BC * inlet_loss +
+                 W_WALL_BC * wall_loss)
 
-        return loss
+        return total, ns_loss, cont_loss, inlet_loss, wall_loss
 
 
 # ============================================================================
@@ -329,6 +358,7 @@ def main():
 
         X_train_inner = X_train[train_ix_inner]
         Y_train_inner = Y_train[train_ix_inner]
+        Z_train_inner = Z_train[train_ix_inner]
         X_val = X_train[val_ix]
         Y_val = Y_train[val_ix]
 
@@ -348,57 +378,95 @@ def main():
             pinn.train()
             wss_pred_net.train()
 
-            # Prepare batches: sample random points and time steps
             train_losses = []
+            pinn_loss_log = []
 
-            for _ in range(5):  # 5 mini-batches per epoch
-                # Sample random points and timesteps
-                batch_n_samples = min(512, len(X_train_inner) * INLET_TIMESTEPS)
-                sample_idx_patient = np.random.choice(len(X_train_inner), batch_n_samples // INLET_TIMESTEPS, replace=True)
-                sample_idx_time = np.random.choice(INLET_TIMESTEPS, batch_n_samples // INLET_TIMESTEPS, replace=True)
+            for _ in range(3):  # 3 mini-batches per epoch (reduced due to autodiff cost)
+                # === Sample PINN training points ===
+                n_interior = 128
+                n_boundary = 64
 
-                xyz_list = []
-                for pidx, tidx in zip(sample_idx_patient, sample_idx_time):
-                    xyz = X_train_inner[pidx]
-                    # Sample points on surface
-                    pt_idx = np.random.choice(4096, 64, replace=False)
+                # Interior points (random points from interior + random times)
+                interior_pt_idx = np.random.choice(NUM_INTERIOR_POINTS, n_interior, replace=True)
+                interior_patient_idx = np.random.choice(len(X_train_inner), n_interior, replace=True)
+                interior_time_idx = np.random.choice(INLET_TIMESTEPS, n_interior, replace=True)
+
+                xyz_interior_list = []
+                for pidx, ptidx, tidx in zip(interior_patient_idx, interior_pt_idx, interior_time_idx):
+                    pt = X_interior_train[pidx, ptidx]
                     t_norm = tidx / INLET_TIMESTEPS
-                    xyz_t = np.concatenate([
-                        xyz[pt_idx],
-                        np.full((64, 1), t_norm)
-                    ], axis=1)
-                    xyz_list.append(xyz_t)
+                    xyz_t = np.concatenate([pt, [t_norm]])
+                    xyz_interior_list.append(xyz_t)
+                xyz_interior = np.array(xyz_interior_list, dtype=np.float32)
+                xyz_interior_t = torch.tensor(xyz_interior, device=device, requires_grad=True)
 
-                xyz_batch = np.concatenate(xyz_list, axis=0).astype(np.float32)
-                xyz_batch_t = torch.tensor(xyz_batch, device=device)
+                # Inlet boundary points (surface + inlet times)
+                inlet_pt_idx = np.random.choice(4096, n_boundary, replace=True)
+                inlet_patient_idx = np.random.choice(len(X_train_inner), n_boundary, replace=True)
+                inlet_time_idx = np.random.choice(INLET_TIMESTEPS, n_boundary, replace=True)
 
-                # PINN loss (simplified - just L2 regularization on velocity)
-                flow_batch = pinn(xyz_batch_t)
-                u = flow_batch[:, 0:1]
-                pinn_loss = torch.mean(u ** 2) * 0.01  # Weak regularization
+                xyz_inlet_list = []
+                for pidx, ptidx, tidx in zip(inlet_patient_idx, inlet_pt_idx, inlet_time_idx):
+                    pt = X_train_inner[pidx, ptidx]
+                    t_norm = tidx / INLET_TIMESTEPS
+                    xyz_t = np.concatenate([pt, [t_norm]])
+                    xyz_inlet_list.append(xyz_t)
+                xyz_inlet = np.array(xyz_inlet_list, dtype=np.float32)
+                xyz_inlet_t = torch.tensor(xyz_inlet, device=device, requires_grad=True)
 
-                # WSS loss
-                vel_mag = torch.norm(flow_batch[:, :3], dim=1, keepdim=True)
-                flow_feat = torch.cat([xyz_batch_t[:, :3], vel_mag], dim=1)
-                wss_out = wss_pred_net(flow_feat)
+                # Inlet velocity BC target (from Z waveform)
+                u_inlet_target = torch.tensor(
+                    Z_train_inner[inlet_patient_idx, inlet_time_idx],
+                    device=device, dtype=torch.float32
+                ).unsqueeze(1)
 
-                # Get ground truth WSS (flattened)
-                y_batch_idx = np.concatenate([
-                    np.full((64,), train_idx, dtype=int)
-                    for train_idx in sample_idx_patient
-                ])
-                pt_batch_idx = np.concatenate([
-                    np.random.choice(4096, 64, replace=False)
-                    for _ in sample_idx_patient
-                ])
-                y_batch = Y_train_inner[y_batch_idx, pt_batch_idx]
-                y_batch_t = torch.tensor(y_batch, device=device, dtype=torch.float32).unsqueeze(1)
+                # Wall boundary points
+                wall_pt_idx = np.random.choice(4096, n_boundary, replace=True)
+                wall_patient_idx = np.random.choice(len(X_train_inner), n_boundary, replace=True)
+                wall_time_idx = np.random.choice(INLET_TIMESTEPS, n_boundary, replace=True)
 
-                wss_loss = wss_mse(wss_out, y_batch_t)
+                xyz_wall_list = []
+                for pidx, ptidx, tidx in zip(wall_patient_idx, wall_pt_idx, wall_time_idx):
+                    pt = X_train_inner[pidx, ptidx]
+                    t_norm = tidx / INLET_TIMESTEPS
+                    xyz_t = np.concatenate([pt, [t_norm]])
+                    xyz_wall_list.append(xyz_t)
+                xyz_wall = np.array(xyz_wall_list, dtype=np.float32)
+                xyz_wall_t = torch.tensor(xyz_wall, device=device, requires_grad=True)
 
-                total_loss = pinn_loss + wss_loss
-                train_losses.append(total_loss.item())
+                # === PINN loss ===
+                pinn_loss_fn = PINN_Loss(pinn, device, rho=RHO, mu=MU)
+                pinn_total, ns_l, cont_l, inlet_l, wall_l = pinn_loss_fn.total_loss(
+                    xyz_interior_t, xyz_inlet_t, u_inlet_target, xyz_wall_t
+                )
 
+                # === WSS prediction loss ===
+                # Sample surface points at t=0 for WSS prediction
+                wss_pt_idx = np.random.choice(4096, 128, replace=True)
+                wss_patient_idx = np.random.choice(len(X_train_inner), 128, replace=True)
+
+                xyz_wss_list = []
+                for pidx, ptidx in zip(wss_patient_idx, wss_pt_idx):
+                    pt = X_train_inner[pidx, ptidx]
+                    xyz_t = np.concatenate([pt, [0.0]])  # t=0
+                    xyz_wss_list.append(xyz_t)
+                xyz_wss = np.array(xyz_wss_list, dtype=np.float32)
+                xyz_wss_t = torch.tensor(xyz_wss, device=device)
+
+                with torch.no_grad():
+                    flow_wss = pinn(xyz_wss_t)
+                    vel_mag_wss = torch.norm(flow_wss[:, :3], dim=1, keepdim=True)
+                    flow_feat_wss = torch.cat([xyz_wss_t[:, :3], vel_mag_wss], dim=1)
+
+                wss_pred_out = wss_pred_net(flow_feat_wss)
+                y_wss = Y_train_inner[wss_patient_idx, wss_pt_idx]
+                y_wss_t = torch.tensor(y_wss, device=device, dtype=torch.float32).unsqueeze(1)
+                wss_loss = wss_mse(wss_pred_out, y_wss_t)
+
+                # Combined loss
+                total_loss = pinn_total + wss_loss
+
+                # Backprop
                 optimizer_pinn.zero_grad()
                 optimizer_wss.zero_grad()
                 total_loss.backward()
@@ -407,29 +475,35 @@ def main():
                 optimizer_pinn.step()
                 optimizer_wss.step()
 
-            # Validation on full val set
+                train_losses.append(total_loss.item())
+                pinn_loss_log.append((ns_l.item(), cont_l.item(), inlet_l.item(), wall_l.item()))
+
+            # Validation on val set (sample to save time)
             pinn.eval()
             wss_pred_net.eval()
             with torch.no_grad():
-                val_loss_total = 0
-                val_n = 0
-                for i in range(len(X_val)):
-                    # All 4096 points at time t=0
-                    xyz_val = np.concatenate([X_val[i], np.zeros((4096, 1))], axis=1).astype(np.float32)
+                val_wss_loss = 0
+                val_n = min(len(X_val), 5)  # Sample max 5 patients for speed
+                val_idx = np.random.choice(len(X_val), val_n, replace=False)
+                for i in val_idx:
+                    # Sample points at t=0
+                    pt_idx = np.random.choice(4096, 256, replace=False)
+                    xyz_val = np.concatenate([X_val[i, pt_idx], np.zeros((256, 1))], axis=1).astype(np.float32)
                     xyz_val_t = torch.tensor(xyz_val, device=device)
                     flow_val = pinn(xyz_val_t)
                     vel_mag_val = torch.norm(flow_val[:, :3], dim=1, keepdim=True)
                     flow_feat_val = torch.cat([xyz_val_t[:, :3], vel_mag_val], dim=1)
                     wss_val_pred = wss_pred_net(flow_feat_val).squeeze(1).cpu().numpy()
-                    wss_val_true = Y_val[i]
-                    val_loss = np.mean((wss_val_pred - wss_val_true) ** 2)
-                    val_loss_total += val_loss
-                    val_n += 1
+                    wss_val_true = Y_val[i, pt_idx]
+                    val_wss_loss += np.mean((wss_val_pred - wss_val_true) ** 2)
 
-                val_loss_avg = val_loss_total / val_n
+                val_loss_avg = val_wss_loss / len(val_idx)
 
-            if epoch % 50 == 0:
-                logging.info(f"Epoch {epoch:3d}: train_loss={np.mean(train_losses):.6f}, val_loss={val_loss_avg:.6f}")
+            if epoch % 25 == 0:
+                ns_avg, cont_avg, inlet_avg, wall_avg = np.mean(pinn_loss_log, axis=0)
+                logging.info(f"Epoch {epoch:3d}: train={np.mean(train_losses):.6f}, "
+                           f"NS={ns_avg:.6f}, Cont={cont_avg:.6f}, Inlet={inlet_avg:.6f}, Wall={wall_avg:.6f}, "
+                           f"val_WSS={val_loss_avg:.6f}")
 
             # Early stopping
             if val_loss_avg < best_val_loss:
