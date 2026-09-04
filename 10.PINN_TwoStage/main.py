@@ -43,8 +43,16 @@ SEED = 2024
 # PINN training
 PINN_EPOCHS = 100
 PINN_STEPS_PER_EPOCH = 8  # Multiple patient samples per epoch so a fold's ~90 patients get real coverage
+PATIENTS_PER_BATCH = 4  # Mix multiple patients into every gradient step (real mini-batch diversity,
+                         # not a single patient's gradient dominating each update)
 PINN_LR = 1e-3
 PINN_PATIENCE = 20
+
+# Points sampled per patient within a batch, split so the total points/step
+# (and hence compute cost) stays about the same as a single full-patient step
+WALL_POINTS_PER_PATIENT = NUM_SURFACE_POINTS // PATIENTS_PER_BATCH
+NS_POINTS_PER_PATIENT = NS_SUBSAMPLE // PATIENTS_PER_BATCH
+WSS_POINTS_PER_PATIENT = NUM_SURFACE_POINTS // PATIENTS_PER_BATCH
 
 # Loss weights (Navier-Stokes)
 W_WALL_BC = 1.0        # No-slip at the true wall surface
@@ -529,29 +537,39 @@ def main():
             pinn_loss_log = []
 
             for _ in range(PINN_STEPS_PER_EPOCH):
-                # === Sample one patient per step (full surface + interior) ===
-                patient_idx = np.random.randint(0, len(X_train_inner))
-                time_idx = np.random.randint(0, INLET_TIMESTEPS)
-                t_norm = time_idx / INLET_TIMESTEPS
+                # === Physics: mix PATIENTS_PER_BATCH patients into this one
+                # gradient step (each at its own random time) so the update
+                # direction reflects several geometries at once, instead of
+                # one patient's field dominating the step and the next
+                # step's patient yanking it somewhere else. ===
+                batch_patients = np.random.randint(0, len(X_train_inner), size=PATIENTS_PER_BATCH)
 
-                # Wall no-slip: every surface point is a true wall point
-                xyz_wall = np.concatenate([
-                    X_train_inner[patient_idx],
-                    np.full((NUM_SURFACE_POINTS, 1), t_norm)
-                ], axis=1).astype(np.float32)
+                wall_parts, interior_parts, u_sup_parts = [], [], []
+                for p in batch_patients:
+                    time_idx = np.random.randint(0, INLET_TIMESTEPS)
+                    t_norm = time_idx / INLET_TIMESTEPS
+
+                    wall_pt_idx = np.random.choice(NUM_SURFACE_POINTS, WALL_POINTS_PER_PATIENT, replace=False)
+                    wall_parts.append(np.concatenate([
+                        X_train_inner[p][wall_pt_idx],
+                        np.full((WALL_POINTS_PER_PATIENT, 1), t_norm)
+                    ], axis=1))
+
+                    interior_idx = np.random.choice(NUM_INTERIOR_POINTS, NS_POINTS_PER_PATIENT, replace=False)
+                    interior_parts.append(np.concatenate([
+                        X_interior_train[p][interior_idx],
+                        np.full((NS_POINTS_PER_PATIENT, 1), t_norm)
+                    ], axis=1))
+                    u_sup_parts.append(flow_train_inner[p][interior_idx, time_idx, :])
+
+                xyz_wall = np.concatenate(wall_parts, axis=0).astype(np.float32)
                 xyz_wall_t = torch.tensor(xyz_wall, device=device, requires_grad=True)
 
-                # Interior: NS residual + Poiseuille supervision
-                interior_idx = np.random.choice(NUM_INTERIOR_POINTS, NS_SUBSAMPLE, replace=False)
-                xyz_interior = np.concatenate([
-                    X_interior_train[patient_idx][interior_idx],
-                    np.full((NS_SUBSAMPLE, 1), t_norm)
-                ], axis=1).astype(np.float32)
+                xyz_interior = np.concatenate(interior_parts, axis=0).astype(np.float32)
                 xyz_interior_t = torch.tensor(xyz_interior, device=device, requires_grad=True)
 
                 u_supervised = torch.tensor(
-                    flow_train_inner[patient_idx][interior_idx, time_idx, :],
-                    device=device, dtype=torch.float32
+                    np.concatenate(u_sup_parts, axis=0), device=device, dtype=torch.float32
                 )
 
                 pinn_total, wall_l, cont_l, ns_l, flow_l = pinn_loss_fn.total_loss(
@@ -560,23 +578,33 @@ def main():
 
                 # === WSS prediction loss ===
                 # Feature = wall shear RATE (dU/dn), not raw velocity, since
-                # velocity at the wall is driven to ~0 by no-slip.
-                wss_patient_idx = np.random.randint(0, len(X_train_inner))
-                xyz_wss = np.concatenate([
-                    X_train_inner[wss_patient_idx],
-                    np.zeros((NUM_SURFACE_POINTS, 1))  # t=0
-                ], axis=1).astype(np.float32)
+                # velocity at the wall is driven to ~0 by no-slip. Same
+                # multi-patient batching as above, for the same reason.
+                wss_batch_patients = np.random.randint(0, len(X_train_inner), size=PATIENTS_PER_BATCH)
+
+                wss_xyz_parts, wss_normal_parts, wss_y_parts = [], [], []
+                for p in wss_batch_patients:
+                    wss_pt_idx = np.random.choice(NUM_SURFACE_POINTS, WSS_POINTS_PER_PATIENT, replace=False)
+                    wss_xyz_parts.append(np.concatenate([
+                        X_train_inner[p][wss_pt_idx],
+                        np.zeros((WSS_POINTS_PER_PATIENT, 1))  # t=0
+                    ], axis=1))
+                    wss_normal_parts.append(normals_train_inner[p][wss_pt_idx])
+                    wss_y_parts.append(Y_train_inner[p][wss_pt_idx])
+
+                xyz_wss = np.concatenate(wss_xyz_parts, axis=0).astype(np.float32)
                 xyz_wss_t = torch.tensor(xyz_wss, device=device)
                 wss_normals_t = torch.tensor(
-                    normals_train_inner[wss_patient_idx], device=device, dtype=torch.float32
+                    np.concatenate(wss_normal_parts, axis=0), device=device, dtype=torch.float32
                 )
 
                 shear_feat = compute_wall_shear_feature(pinn, xyz_wss_t, wss_normals_t)
                 flow_feat_wss = torch.cat([xyz_wss_t[:, :3], shear_feat], dim=1)
 
                 wss_pred_out = wss_pred_net(flow_feat_wss)
-                y_wss = Y_train_inner[wss_patient_idx]
-                y_wss_t = torch.tensor(y_wss, device=device, dtype=torch.float32).unsqueeze(1)
+                y_wss_t = torch.tensor(
+                    np.concatenate(wss_y_parts, axis=0), device=device, dtype=torch.float32
+                ).unsqueeze(1)
                 wss_loss = wss_mse(wss_pred_out, y_wss_t)
 
                 # Combined loss with scaling (avoid physics loss from dominating)
