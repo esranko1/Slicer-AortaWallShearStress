@@ -40,10 +40,10 @@ N_FOLDS = 10
 SEED = 2024
 
 # PINN training
-PINN_EPOCHS = 200
+PINN_EPOCHS = 100  # Reduced since each epoch now processes all points
 PINN_BATCH_SIZE = 32
 PINN_LR = 1e-3
-PINN_PATIENCE = 30
+PINN_PATIENCE = 20  # Earlier stopping with more constraint per epoch
 
 # Loss weights (Navier-Stokes)
 W_CONTINUITY = 1.0
@@ -101,6 +101,55 @@ def generate_interior_points(surface_points, normals, wall_thickness):
     """
     interior = surface_points - wall_thickness * normals
     return interior
+
+
+def compute_poiseuille_flow(surface_points, inlet_velocity_waveform):
+    """
+    Compute Poiseuille flow field for aorta.
+    Assumes parabolic profile: u = u_max * (1 - (r/R)²)
+
+    surface_points: (4096, 3) - point cloud
+    inlet_velocity_waveform: (50,) - Z(t) velocity over time
+
+    returns: flow_field (4096, 50, 3) - u,v,w at each point, each timestep
+             where flow is along dominant axis (z-direction of PCA)
+    """
+    n_points = surface_points.shape[0]
+    n_times = len(inlet_velocity_waveform)
+
+    # Compute principal axis (flow direction) via PCA
+    centroid = surface_points.mean(axis=0)
+    centered = surface_points - centroid
+    cov = centered.T @ centered
+    eigvals, eigvecs = np.linalg.eigh(cov)
+    flow_direction = eigvecs[:, -1]  # Direction of maximum variance (flow axis)
+
+    # Project all points onto flow direction to get axial position
+    axial_position = centered @ flow_direction  # (4096,)
+
+    # Compute radial distance from flow axis for each point
+    # r = ||point - (point·flow_direction)*flow_direction||
+    axial_component = np.outer(axial_position, flow_direction)  # (4096, 3)
+    radial_vector = centered - axial_component  # (4096, 3)
+    radial_distance = np.linalg.norm(radial_vector, axis=1)  # (4096,)
+
+    # Estimate vessel radius as 90th percentile of radial distance
+    vessel_radius = np.percentile(radial_distance, 90)
+
+    # Compute Poiseuille profile: u_z = u_max * (1 - (r/R)²)
+    # For r > R, clip to 0
+    r_normalized = np.clip(radial_distance / vessel_radius, 0, 1)
+    poiseuille_profile = 1.0 - r_normalized**2  # (4096,)
+
+    # Broadcast over time and compute velocity components
+    flow_field = np.zeros((n_points, n_times, 3), dtype=np.float32)
+    for t in range(n_times):
+        u_max = inlet_velocity_waveform[t]
+        u_axial = u_max * poiseuille_profile  # (4096,)
+        # Velocity in flow direction
+        flow_field[:, t, :] = np.outer(u_axial, flow_direction).astype(np.float32)
+
+    return flow_field, flow_direction, vessel_radius
 
 
 def get_device():
@@ -226,17 +275,15 @@ class PINN_Loss:
 
         return ns_loss, cont_loss
 
-    def total_loss(self, xyz_interior, xyz_inlet, u_inlet_target, xyz_wall):
+    def total_loss(self, xyz_inlet, u_inlet_target, xyz_wall, xyz_supervised=None, u_supervised_target=None):
         """
-        Total physics-informed loss with boundary conditions.
-        xyz_interior: (batch, 4) interior points
+        Total physics-informed loss with boundary conditions and supervised flow.
         xyz_inlet: (batch, 4) inlet boundary points
         u_inlet_target: (batch, 1) inlet velocity BC value
         xyz_wall: (batch, 4) wall boundary points
+        xyz_supervised: (batch, 4) points for supervised flow loss [optional]
+        u_supervised_target: (batch, 3) ground-truth flow field [optional]
         """
-        # PDE residuals at interior
-        ns_loss, cont_loss = self.navier_stokes_loss(xyz_interior)
-
         # Inlet boundary condition: u_normal = Z(t)
         flow_inlet = self.model(xyz_inlet)
         u_inlet_pred = flow_inlet[:, 0:1]  # Normal component
@@ -247,13 +294,20 @@ class PINN_Loss:
         u_wall = flow_wall[:, 0:3]  # u, v, w
         wall_loss = torch.mean(u_wall**2)
 
-        # Total loss
-        total = (W_CONTINUITY * cont_loss +
-                 W_MOMENTUM * ns_loss +
-                 W_INLET_BC * inlet_loss +
-                 W_WALL_BC * wall_loss)
+        # Supervised flow loss (Poiseuille flow supervision)
+        if xyz_supervised is not None and u_supervised_target is not None:
+            flow_supervised = self.model(xyz_supervised)
+            u_supervised_pred = flow_supervised[:, 0:3]  # u, v, w
+            supervised_loss = torch.mean((u_supervised_pred - u_supervised_target)**2)
+        else:
+            supervised_loss = 0.0
 
-        return total, ns_loss, cont_loss, inlet_loss, wall_loss
+        # Total loss (removed PDE residuals - relying on supervised flow instead)
+        total = (W_INLET_BC * inlet_loss +
+                 W_WALL_BC * wall_loss +
+                 0.5 * supervised_loss)  # Weight supervised loss equally
+
+        return total, inlet_loss, wall_loss, supervised_loss
 
 
 # ============================================================================
@@ -334,6 +388,13 @@ def main():
 
     logging.info(f"Interior points generated: {X_interior_all.shape}")
 
+    # Precompute Poiseuille flow supervision
+    logging.info("Computing Poiseuille flow fields for all patients...")
+    flow_poiseuille = np.zeros((100, NUM_SURFACE_POINTS, INLET_TIMESTEPS, 3), dtype=np.float32)
+    for i in range(100):
+        flow_poiseuille[i], _, _ = compute_poiseuille_flow(X[i], Z[i])
+    logging.info(f"Poiseuille flows computed: {flow_poiseuille.shape}")
+
     # ========================================================================
     # Main 10-fold CV loop
     # ========================================================================
@@ -350,7 +411,7 @@ def main():
         X_train, X_test = X[train_ix], X[test_ix]
         Z_train, Z_test = Z[train_ix], Z[test_ix]
         Y_train, Y_test = Y_scaled[train_ix], Y_scaled[test_ix]
-        X_interior_train = X_interior_all[train_ix]
+        X_interior_train_fold = X_interior_all[train_ix]  # All fold training patients
 
         # Split train into train+val (9:1)
         n_train = len(X_train)
@@ -361,6 +422,8 @@ def main():
         X_train_inner = X_train[train_ix_inner]
         Z_train_inner = Z_train[train_ix_inner]
         Y_train_inner = Y_train[train_ix_inner]
+        X_interior_train = X_interior_train_fold[train_ix_inner]  # Only train (not val) interior points
+        flow_train_inner = flow_poiseuille[train_ix[train_ix_inner]]  # Map back to original patient indices
         X_val = X_train[val_ix]
         Y_val = Y_train[val_ix]
 
@@ -383,76 +446,63 @@ def main():
             train_losses = []
             pinn_loss_log = []
 
-            for _ in range(3):  # 3 mini-batches per epoch (reduced due to autodiff cost)
-                # === Sample PINN training points ===
-                n_interior = 128
-                n_boundary = 64
+            for _ in range(1):  # 1 full batch per epoch (all surface + interior points)
+                # === Sample one patient per epoch (full surface + interior) ===
+                patient_idx = np.random.randint(0, len(X_train_inner))
+                time_idx = np.random.randint(0, INLET_TIMESTEPS)
+                t_norm = time_idx / INLET_TIMESTEPS
 
-                # Interior points (random points from interior + random times)
-                interior_pt_idx = np.random.choice(NUM_INTERIOR_POINTS, n_interior, replace=True)
-                interior_patient_idx = np.random.choice(len(X_train_inner), n_interior, replace=True)
-                interior_time_idx = np.random.choice(INLET_TIMESTEPS, n_interior, replace=True)
-
-                xyz_interior_list = []
-                for pidx, ptidx, tidx in zip(interior_patient_idx, interior_pt_idx, interior_time_idx):
-                    pt = X_interior_train[pidx, ptidx]
-                    t_norm = tidx / INLET_TIMESTEPS
-                    xyz_t = np.concatenate([pt, [t_norm]])
-                    xyz_interior_list.append(xyz_t)
-                xyz_interior = np.array(xyz_interior_list, dtype=np.float32)
+                # All interior points for this patient at this time
+                xyz_interior = np.concatenate([
+                    X_interior_train[patient_idx],
+                    np.full((NUM_INTERIOR_POINTS, 1), t_norm)
+                ], axis=1).astype(np.float32)
                 xyz_interior_t = torch.tensor(xyz_interior, device=device, requires_grad=True)
 
-                # Inlet boundary points (surface + inlet times)
-                inlet_pt_idx = np.random.choice(4096, n_boundary, replace=True)
-                inlet_patient_idx = np.random.choice(len(X_train_inner), n_boundary, replace=True)
-                inlet_time_idx = np.random.choice(INLET_TIMESTEPS, n_boundary, replace=True)
-
-                xyz_inlet_list = []
-                for pidx, ptidx, tidx in zip(inlet_patient_idx, inlet_pt_idx, inlet_time_idx):
-                    pt = X_train_inner[pidx, ptidx]
-                    t_norm = tidx / INLET_TIMESTEPS
-                    xyz_t = np.concatenate([pt, [t_norm]])
-                    xyz_inlet_list.append(xyz_t)
-                xyz_inlet = np.array(xyz_inlet_list, dtype=np.float32)
+                # All surface points for inlet BC at this time
+                xyz_inlet = np.concatenate([
+                    X_train_inner[patient_idx],  # All 4096 surface points
+                    np.full((4096, 1), t_norm)
+                ], axis=1).astype(np.float32)
                 xyz_inlet_t = torch.tensor(xyz_inlet, device=device, requires_grad=True)
 
-                # Inlet velocity BC target (from Z waveform)
-                u_inlet_target = torch.tensor(
-                    Z_train_inner[inlet_patient_idx, inlet_time_idx],
+                # Inlet velocity BC target (same for all surface points, from Z waveform)
+                u_inlet_target = torch.full(
+                    (4096, 1),
+                    Z_train_inner[patient_idx, time_idx].item(),
                     device=device, dtype=torch.float32
-                ).unsqueeze(1)
+                )
 
-                # Wall boundary points
-                wall_pt_idx = np.random.choice(4096, n_boundary, replace=True)
-                wall_patient_idx = np.random.choice(len(X_train_inner), n_boundary, replace=True)
-                wall_time_idx = np.random.choice(INLET_TIMESTEPS, n_boundary, replace=True)
-
-                xyz_wall_list = []
-                for pidx, ptidx, tidx in zip(wall_patient_idx, wall_pt_idx, wall_time_idx):
-                    pt = X_train_inner[pidx, ptidx]
-                    t_norm = tidx / INLET_TIMESTEPS
-                    xyz_t = np.concatenate([pt, [t_norm]])
-                    xyz_wall_list.append(xyz_t)
-                xyz_wall = np.array(xyz_wall_list, dtype=np.float32)
+                # Wall boundary points (same surface, different random time for wall BC)
+                wall_time_idx = np.random.randint(0, INLET_TIMESTEPS)
+                wall_t_norm = wall_time_idx / INLET_TIMESTEPS
+                xyz_wall = np.concatenate([
+                    X_train_inner[patient_idx],  # All 4096 surface points
+                    np.full((4096, 1), wall_t_norm)
+                ], axis=1).astype(np.float32)
                 xyz_wall_t = torch.tensor(xyz_wall, device=device, requires_grad=True)
 
-                # === PINN loss ===
+                # === PINN loss with supervised Poiseuille flow ===
                 pinn_loss_fn = PINN_Loss(pinn, device, rho=RHO, mu=MU)
-                pinn_total, ns_l, cont_l, inlet_l, wall_l = pinn_loss_fn.total_loss(
-                    xyz_interior_t, xyz_inlet_t, u_inlet_target, xyz_wall_t
+
+                # Get supervised flow for all surface points at this time
+                u_supervised = torch.tensor(
+                    flow_train_inner[patient_idx, :, time_idx, :],  # (4096, 3)
+                    device=device, dtype=torch.float32
+                )
+
+                pinn_total, inlet_l, wall_l, flow_l = pinn_loss_fn.total_loss(
+                    xyz_inlet_t, u_inlet_target, xyz_wall_t,
+                    xyz_inlet_t, u_supervised  # Use all surface points for supervised loss
                 )
 
                 # === WSS prediction loss ===
-                # Sample surface points at t=0 for WSS prediction
-                wss_pt_idx = np.random.choice(4096, 128, replace=True)
-                wss_patient_idx = np.random.choice(len(X_train_inner), 128, replace=True)
-
-                xyz_wss_list = []
-                for pidx, ptidx in zip(wss_patient_idx, wss_pt_idx):
-                    pt = X_train_inner[pidx, ptidx]
-                    xyz_t = np.concatenate([pt, [0.0]])  # t=0
-                    xyz_wss_list.append(xyz_t)
-                xyz_wss = np.array(xyz_wss_list, dtype=np.float32)
+                # Sample random patient, all surface points at t=0
+                wss_patient_idx = np.random.randint(0, len(X_train_inner))
+                xyz_wss = np.concatenate([
+                    X_train_inner[wss_patient_idx],  # All 4096 surface points
+                    np.zeros((4096, 1))  # t=0
+                ], axis=1).astype(np.float32)
                 xyz_wss_t = torch.tensor(xyz_wss, device=device)
 
                 with torch.no_grad():
@@ -461,7 +511,7 @@ def main():
                     flow_feat_wss = torch.cat([xyz_wss_t[:, :3], vel_mag_wss], dim=1)
 
                 wss_pred_out = wss_pred_net(flow_feat_wss)
-                y_wss = Y_train_inner[wss_patient_idx, wss_pt_idx]
+                y_wss = Y_train_inner[wss_patient_idx]  # All 4096 points
                 y_wss_t = torch.tensor(y_wss, device=device, dtype=torch.float32).unsqueeze(1)
                 wss_loss = wss_mse(wss_pred_out, y_wss_t)
 
@@ -480,7 +530,7 @@ def main():
                 optimizer_wss.step()
 
                 train_losses.append(total_loss.item())
-                pinn_loss_log.append((ns_l.item(), cont_l.item(), inlet_l.item(), wall_l.item()))
+                pinn_loss_log.append((inlet_l.item(), wall_l.item(), flow_l if isinstance(flow_l, float) else flow_l.item()))
 
             # Validation on val set (sample to save time)
             pinn.eval()
@@ -503,11 +553,11 @@ def main():
 
                 val_loss_avg = val_wss_loss / len(val_idx)
 
-            if epoch % 25 == 0 and len(pinn_loss_log) > 0:
+            if epoch % 10 == 0 and len(pinn_loss_log) > 0:
                 pinn_logs_arr = np.array(pinn_loss_log)
-                ns_avg, cont_avg, inlet_avg, wall_avg = np.mean(pinn_logs_arr, axis=0)
+                inlet_avg, wall_avg, flow_avg = np.mean(pinn_logs_arr, axis=0)
                 logging.info(f"Epoch {epoch:3d}: train={np.mean(train_losses):.6f}, "
-                           f"NS={ns_avg:.6f}, Cont={cont_avg:.6f}, Inlet={inlet_avg:.6f}, Wall={wall_avg:.6f}, "
+                           f"Inlet={inlet_avg:.6f}, Wall={wall_avg:.6f}, Flow={flow_avg:.6f}, "
                            f"val_WSS={val_loss_avg:.6f}")
 
             # Early stopping
