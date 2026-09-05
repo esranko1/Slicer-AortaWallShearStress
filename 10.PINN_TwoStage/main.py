@@ -60,6 +60,14 @@ WALL_POINTS_PER_PATIENT = NUM_SURFACE_POINTS // PATIENTS_PER_BATCH
 NS_POINTS_PER_PATIENT = NS_SUBSAMPLE // PATIENTS_PER_BATCH
 WSS_POINTS_PER_PATIENT = NUM_SURFACE_POINTS // PATIENTS_PER_BATCH
 
+# Patient conditioning: [inlet_velocity_at_t, vessel_radius, flow_dir_x,
+# flow_dir_y, flow_dir_z], appended to every point fed to the PINN. Without
+# this, one shared f(x,y,z,t) is fit across ~90 different patients with
+# nothing telling it which patient a point belongs to - two patients can
+# land at nearly the same normalized coordinates with different Poiseuille
+# targets, and the network can only average across the conflict.
+COND_DIM = 5
+
 # Loss weights (Navier-Stokes)
 W_WALL_BC = 1.0        # No-slip at the true wall surface
 W_CONTINUITY = 1.0     # ∇·u = 0, enforced in the interior
@@ -183,6 +191,26 @@ def compute_poiseuille_profile(radial_distance, vessel_radius, flow_direction, i
     return flow_field
 
 
+def build_cond(waveform_value, vessel_radius, flow_direction, n_points):
+    """
+    Broadcast one patient's conditioning vector - [inlet_velocity_at_t,
+    vessel_radius, flow_dir_x, flow_dir_y, flow_dir_z] - across n_points,
+    so every point fed to the PINN carries which patient's geometry/flow
+    condition it belongs to.
+
+    waveform_value: scalar, Z[patient, time_idx]
+    vessel_radius: scalar
+    flow_direction: (3,)
+    returns: (n_points, COND_DIM)
+    """
+    cond_vec = np.concatenate([
+        np.array([waveform_value], dtype=np.float32),
+        np.array([vessel_radius], dtype=np.float32),
+        flow_direction.astype(np.float32)
+    ])
+    return np.tile(cond_vec, (n_points, 1))
+
+
 def get_device():
     return torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -195,20 +223,29 @@ class PINN_FlowSolver(nn.Module):
     """
     Physics-Informed Neural Network for Navier-Stokes with Fourier features.
     Outputs: u(x,y,z,t), v, w, p = flow field
+
+    Input carries COND_DIM extra columns after [x,y,z,t]: the patient's
+    inlet velocity at this t, vessel radius, and flow direction. Only the
+    first 4 columns are Fourier-encoded / differentiated for the PDE
+    residual (navier_stokes_loss and compute_wall_shear_feature already
+    only ever slice columns 0-3 out of any gradient they take, so appending
+    extra trailing columns needed no changes there) - the conditioning
+    columns are passed straight through to the MLP.
     """
 
-    def __init__(self, hidden_dim=128, num_layers=4, fourier_features=32):
+    def __init__(self, hidden_dim=128, num_layers=4, fourier_features=32, cond_dim=COND_DIM):
         super().__init__()
 
         self.fourier_features = fourier_features
-        # Fourier feature matrix for positional encoding
+        self.cond_dim = cond_dim
+        # Fourier feature matrix for positional encoding (spatial+time only)
         self.register_buffer(
             'fourier_matrix',
             torch.randn(4, fourier_features) * np.pi
         )
 
-        # Input: 4 (xyz,t) + 2*fourier_features (sin/cos of Fourier features)
-        input_dim = 4 + 2 * fourier_features
+        # Input: 4 (xyz,t) + 2*fourier_features (sin/cos) + cond_dim
+        input_dim = 4 + 2 * fourier_features + cond_dim
 
         layers = []
         layers.append(nn.Linear(input_dim, hidden_dim))
@@ -224,17 +261,20 @@ class PINN_FlowSolver(nn.Module):
 
     def forward(self, x):
         """
-        x: (batch, 4) = [x, y, z, t]
+        x: (batch, 4 + cond_dim) = [x, y, z, t, <patient conditioning>]
         returns: (batch, 4) = [u, v, w, p]
         """
-        # Fourier feature encoding
-        fourier_x = x @ self.fourier_matrix  # (batch, fourier_features)
+        spatial = x[:, :4]
+        cond = x[:, 4:]
+
+        # Fourier feature encoding (spatial+time only)
+        fourier_x = spatial @ self.fourier_matrix  # (batch, fourier_features)
         fourier_feat = torch.cat([
             torch.sin(fourier_x),
             torch.cos(fourier_x)
         ], dim=1)  # (batch, 2*fourier_features)
 
-        x_encoded = torch.cat([x, fourier_feat], dim=1)
+        x_encoded = torch.cat([spatial, fourier_feat, cond], dim=1)
         return self.network(x_encoded)
 
 
@@ -256,7 +296,7 @@ def compute_wall_shear_feature(model, xyz_t, wall_normals):
     it works fine on a frozen model. The returned feature is detached, so
     it does not backprop into the PINN.
 
-    xyz_t: (batch, 4) = [x, y, z, t]
+    xyz_t: (batch, 4 + COND_DIM) = [x, y, z, t, <patient conditioning>]
     wall_normals: (batch, 3)
     returns: (batch, 1) shear-rate magnitude
     """
@@ -295,7 +335,9 @@ class PINN_Loss:
         """
         Enforce full Navier-Stokes: ρ(∂u/∂t + u·∇u) + ∇p - μ∇²u = 0
         Computes residual at interior points.
-        xyz_t: (batch, 4) = [x, y, z, t]
+        xyz_t: (batch, 4 + COND_DIM) = [x, y, z, t, <patient conditioning>] -
+               only columns 0-3 are ever sliced out of a gradient below, so
+               the trailing conditioning columns don't affect this method.
         returns: ns_loss, cont_loss, uvw (batch, 3) - both differentiable
                  w.r.t. model parameters, for reuse by the caller.
         """
@@ -353,10 +395,10 @@ class PINN_Loss:
 
     def total_loss(self, xyz_wall, xyz_interior, u_supervised_target):
         """
-        xyz_wall: (batch, 4) - all surface points; the vessel wall, so
-                  no-slip (u=0) applies everywhere here.
-        xyz_interior: (batch, 4) - points inside the lumen; NS residual and
-                  Poiseuille supervision both apply here.
+        xyz_wall: (batch, 4 + COND_DIM) - all surface points; the vessel
+                  wall, so no-slip (u=0) applies everywhere here.
+        xyz_interior: (batch, 4 + COND_DIM) - points inside the lumen; NS
+                  residual and Poiseuille supervision both apply here.
         u_supervised_target: (batch, 3) - Poiseuille flow target at xyz_interior
         """
         flow_wall = self.model(xyz_wall)
@@ -478,6 +520,23 @@ def main():
 
     logging.info(f"Interior points generated: {X_interior_all.shape}")
 
+    # flow_direction is a PCA axis, not a direction - its sign is arbitrary
+    # per patient. Without fixing this, two patients with equivalent
+    # anatomy can get oppositely-signed Poiseuille targets in the same
+    # normalized coordinate frame, which is its own source of contradictory
+    # supervision. Resolve to a consistent sign using the standard trick for
+    # averaging "headless" vectors: average the sign-invariant outer product
+    # d.d^T across patients, then flip each patient to align with the
+    # dominant eigenvector of that average. This only guarantees consistency
+    # across patients, not that the result is the true anatomical forward
+    # direction - but consistency is what the shared network needs.
+    outer_sum = np.einsum('pi,pj->ij', flow_directions, flow_directions)
+    _, ref_eigvecs = np.linalg.eigh(outer_sum)
+    consensus_direction = ref_eigvecs[:, -1]
+    flip_mask = (flow_directions @ consensus_direction) < 0
+    flow_directions[flip_mask] *= -1
+    logging.info(f"Flow direction sign-consistency: flipped {flip_mask.sum()}/{n_patients} patients")
+
     # Precompute Poiseuille flow supervision at the interior points (not at
     # the wall, where the profile is ~0 by definition and just duplicates
     # the no-slip constraint)
@@ -512,6 +571,12 @@ def main():
         flow_interior_train_fold = flow_poiseuille_interior[train_ix]
         normals_train_fold = normals[train_ix]
         normals_test = normals[test_ix]
+        Z_train_fold = Z[train_ix]
+        vessel_radii_train_fold = vessel_radii[train_ix]
+        flow_directions_train_fold = flow_directions[train_ix]
+        Z_test = Z[test_ix]
+        vessel_radii_test = vessel_radii[test_ix]
+        flow_directions_test = flow_directions[test_ix]
 
         # Split train into train+val (9:1)
         n_train = len(X_train)
@@ -524,11 +589,17 @@ def main():
         X_interior_train = X_interior_train_fold[train_ix_inner]
         flow_train_inner = flow_interior_train_fold[train_ix_inner]
         normals_train_inner = normals_train_fold[train_ix_inner]
+        Z_train_inner = Z_train_fold[train_ix_inner]
+        vessel_radii_train_inner = vessel_radii_train_fold[train_ix_inner]
+        flow_directions_train_inner = flow_directions_train_fold[train_ix_inner]
         X_val = X_train[val_ix]
         Y_val = Y_train[val_ix]
         normals_val = normals_train_fold[val_ix]
         X_interior_val = X_interior_train_fold[val_ix]
         flow_interior_val = flow_interior_train_fold[val_ix]
+        Z_val = Z_train_fold[val_ix]
+        vessel_radii_val = vessel_radii_train_fold[val_ix]
+        flow_directions_val = flow_directions_train_fold[val_ix]
 
         # Initialize models
         pinn = PINN_FlowSolver(hidden_dim=128, num_layers=4).to(device)
@@ -565,16 +636,26 @@ def main():
                     time_idx = np.random.randint(0, INLET_TIMESTEPS)
                     t_norm = time_idx / INLET_TIMESTEPS
 
+                    wall_cond = build_cond(
+                        Z_train_inner[p, time_idx], vessel_radii_train_inner[p],
+                        flow_directions_train_inner[p], WALL_POINTS_PER_PATIENT
+                    )
                     wall_pt_idx = np.random.choice(NUM_SURFACE_POINTS, WALL_POINTS_PER_PATIENT, replace=False)
                     wall_parts.append(np.concatenate([
                         X_train_inner[p][wall_pt_idx],
-                        np.full((WALL_POINTS_PER_PATIENT, 1), t_norm)
+                        np.full((WALL_POINTS_PER_PATIENT, 1), t_norm),
+                        wall_cond
                     ], axis=1))
 
+                    interior_cond = build_cond(
+                        Z_train_inner[p, time_idx], vessel_radii_train_inner[p],
+                        flow_directions_train_inner[p], NS_POINTS_PER_PATIENT
+                    )
                     interior_idx = np.random.choice(NUM_INTERIOR_POINTS, NS_POINTS_PER_PATIENT, replace=False)
                     interior_parts.append(np.concatenate([
                         X_interior_train[p][interior_idx],
-                        np.full((NS_POINTS_PER_PATIENT, 1), t_norm)
+                        np.full((NS_POINTS_PER_PATIENT, 1), t_norm),
+                        interior_cond
                     ], axis=1))
                     u_sup_parts.append(flow_train_inner[p][interior_idx, time_idx, :])
 
@@ -613,15 +694,21 @@ def main():
                 time_idx = np.random.randint(0, INLET_TIMESTEPS)
                 t_norm = time_idx / INLET_TIMESTEPS
 
+                wall_cond_val = build_cond(
+                    Z_val[i, time_idx], vessel_radii_val[i], flow_directions_val[i], WALL_POINTS_PER_PATIENT
+                )
                 wall_pt_idx = np.random.choice(NUM_SURFACE_POINTS, WALL_POINTS_PER_PATIENT, replace=False)
                 xyz_wall_val = np.concatenate([
-                    X_val[i][wall_pt_idx], np.full((WALL_POINTS_PER_PATIENT, 1), t_norm)
+                    X_val[i][wall_pt_idx], np.full((WALL_POINTS_PER_PATIENT, 1), t_norm), wall_cond_val
                 ], axis=1).astype(np.float32)
                 xyz_wall_val_t = torch.tensor(xyz_wall_val, device=device, requires_grad=True)
 
+                interior_cond_val = build_cond(
+                    Z_val[i, time_idx], vessel_radii_val[i], flow_directions_val[i], NS_POINTS_PER_PATIENT
+                )
                 interior_idx = np.random.choice(NUM_INTERIOR_POINTS, NS_POINTS_PER_PATIENT, replace=False)
                 xyz_interior_val = np.concatenate([
-                    X_interior_val[i][interior_idx], np.full((NS_POINTS_PER_PATIENT, 1), t_norm)
+                    X_interior_val[i][interior_idx], np.full((NS_POINTS_PER_PATIENT, 1), t_norm), interior_cond_val
                 ], axis=1).astype(np.float32)
                 xyz_interior_val_t = torch.tensor(xyz_interior_val, device=device, requires_grad=True)
 
@@ -685,10 +772,15 @@ def main():
 
                 wss_xyz_parts, wss_normal_parts, wss_y_parts = [], [], []
                 for p in wss_batch_patients:
+                    wss_cond = build_cond(
+                        Z_train_inner[p, 0], vessel_radii_train_inner[p],
+                        flow_directions_train_inner[p], WSS_POINTS_PER_PATIENT
+                    )
                     wss_pt_idx = np.random.choice(NUM_SURFACE_POINTS, WSS_POINTS_PER_PATIENT, replace=False)
                     wss_xyz_parts.append(np.concatenate([
                         X_train_inner[p][wss_pt_idx],
-                        np.zeros((WSS_POINTS_PER_PATIENT, 1))  # t=0
+                        np.zeros((WSS_POINTS_PER_PATIENT, 1)),  # t=0
+                        wss_cond
                     ], axis=1))
                     wss_normal_parts.append(normals_train_inner[p][wss_pt_idx])
                     wss_y_parts.append(Y_train_inner[p][wss_pt_idx])
@@ -720,8 +812,9 @@ def main():
             wss_pred_net.eval()
             val_wss_loss = 0
             for i in range(len(X_val)):
+                val_cond = build_cond(Z_val[i, 0], vessel_radii_val[i], flow_directions_val[i], 256)
                 pt_idx = np.random.choice(NUM_SURFACE_POINTS, 256, replace=False)
-                xyz_val = np.concatenate([X_val[i, pt_idx], np.zeros((256, 1))], axis=1).astype(np.float32)
+                xyz_val = np.concatenate([X_val[i, pt_idx], np.zeros((256, 1)), val_cond], axis=1).astype(np.float32)
                 xyz_val_t = torch.tensor(xyz_val, device=device)
                 val_normals_t = torch.tensor(normals_val[i, pt_idx], device=device, dtype=torch.float32)
 
@@ -759,7 +852,10 @@ def main():
         test_wss_true = []
 
         for i in range(len(X_test)):
-            xyz_test = np.concatenate([X_test[i], np.zeros((NUM_SURFACE_POINTS, 1))], axis=1).astype(np.float32)
+            test_cond = build_cond(Z_test[i, 0], vessel_radii_test[i], flow_directions_test[i], NUM_SURFACE_POINTS)
+            xyz_test = np.concatenate([
+                X_test[i], np.zeros((NUM_SURFACE_POINTS, 1)), test_cond
+            ], axis=1).astype(np.float32)
             xyz_test_t = torch.tensor(xyz_test, device=device)
             test_normals_t = torch.tensor(normals_test[i], device=device, dtype=torch.float32)
 
