@@ -9,7 +9,7 @@ Stage 1: Physics-Informed Neural Network (PINN)
            Poiseuille-flow supervision + NS residual in the interior
 
 Stage 2: WSS Prediction (Supervised)
-  Input: Surface geometry + wall shear rate (∂u/∂n) from Stage 1
+  Input: Surface geometry + wall shear rate (tangential viscous traction) from Stage 1
   Output: WSS predictions
   Learn: Map (geometry + shear-rate) → refined WSS
 """
@@ -40,13 +40,19 @@ INLET_TIMESTEPS = 50
 N_FOLDS = 10
 SEED = 2024
 
-# PINN training
-PINN_EPOCHS = 100
+# PINN training - two SEQUENTIAL stages, not interleaved: Stage 1 trains the
+# flow solver alone to convergence; Stage 2 freezes it and trains the WSS
+# predictor on its now-stable output. Previously both were updated together
+# in one loop, so Stage 2 was chasing a moving target that kept changing
+# every step for the entire training budget.
+STAGE1_EPOCHS = 60      # PINN physics-only training
+STAGE1_PATIENCE = 15
+STAGE2_EPOCHS = 60      # WSS_Predictor training on the frozen PINN
+STAGE2_PATIENCE = 20
 PINN_STEPS_PER_EPOCH = 8  # Multiple patient samples per epoch so a fold's ~90 patients get real coverage
 PATIENTS_PER_BATCH = 4  # Mix multiple patients into every gradient step (real mini-batch diversity,
                          # not a single patient's gradient dominating each update)
 PINN_LR = 1e-3
-PINN_PATIENCE = 20
 
 # Points sampled per patient within a batch, split so the total points/step
 # (and hence compute cost) stays about the same as a single full-patient step
@@ -81,8 +87,8 @@ def compute_normals(points, k=10):
     across the surface), so normals are oriented outward from the point
     cloud's centroid. This matters for generate_interior_points, which needs
     a reliable "inward" direction to land points inside the lumen rather
-    than outside it; compute_wall_shear_feature is unaffected since it only
-    uses the squared normal-derivative magnitude.
+    than outside it; compute_wall_shear_feature is unaffected since its
+    tangential-traction magnitude is invariant to the normal's sign.
 
     points: (N, 3)
     returns: normals (N, 3), normalized, outward-oriented
@@ -234,14 +240,21 @@ class PINN_FlowSolver(nn.Module):
 
 def compute_wall_shear_feature(model, xyz_t, wall_normals):
     """
-    Approximate wall shear rate |dU/dn| via autograd: the wall-normal
-    derivative of the velocity field. WSS is physically proportional to this
-    (tau_w = mu * du_tangential/dn); raw velocity magnitude AT the wall is
-    not usable as a feature since no-slip drives it to ~0 by construction.
+    Wall shear rate from the full velocity Jacobian, not just |dU/dn|: build
+    the symmetric strain-rate tensor D = grad(u) + grad(u)^T, project it onto
+    the wall normal to get the surface traction, then strip out the traction's
+    normal component to leave the tangential part - the quantity WSS is
+    actually proportional to (tau_w = mu * tangential traction), rather than
+    the raw per-component normal derivative. At an exact no-slip wall with a
+    perfect normal these coincide (tangential velocity derivatives vanish
+    there), but this version is more robust to the normal estimate being
+    imperfect (it comes from PCA over a point cloud, not exact geometry).
 
     Must be called outside any torch.no_grad() context (needs a live graph
-    to differentiate w.r.t. the input coordinates). The returned feature is
-    detached, so it does not backprop into the PINN.
+    to differentiate w.r.t. the input coordinates) - this does NOT require
+    the model's parameters to have requires_grad=True, only the input, so
+    it works fine on a frozen model. The returned feature is detached, so
+    it does not backprop into the PINN.
 
     xyz_t: (batch, 4) = [x, y, z, t]
     wall_normals: (batch, 3)
@@ -255,11 +268,14 @@ def compute_wall_shear_feature(model, xyz_t, wall_normals):
     grad_v = torch.autograd.grad(v.sum(), xyz_t, retain_graph=True)[0][:, :3]
     grad_w = torch.autograd.grad(w.sum(), xyz_t, retain_graph=True)[0][:, :3]
 
-    dudn = (grad_u * wall_normals).sum(dim=1, keepdim=True)
-    dvdn = (grad_v * wall_normals).sum(dim=1, keepdim=True)
-    dwdn = (grad_w * wall_normals).sum(dim=1, keepdim=True)
+    jacobian = torch.stack([grad_u, grad_v, grad_w], dim=1)  # (batch, 3, 3), row i = grad of component i
+    strain_rate = jacobian + jacobian.transpose(1, 2)
 
-    shear_rate = torch.sqrt(dudn**2 + dvdn**2 + dwdn**2 + 1e-12)
+    traction = torch.einsum('bij,bj->bi', strain_rate, wall_normals)  # (batch, 3)
+    normal_traction = (traction * wall_normals).sum(dim=1, keepdim=True) * wall_normals
+    tangential_traction = traction - normal_traction
+
+    shear_rate = torch.norm(tangential_traction, dim=1, keepdim=True)
     return shear_rate.detach()
 
 
@@ -511,6 +527,8 @@ def main():
         X_val = X_train[val_ix]
         Y_val = Y_train[val_ix]
         normals_val = normals_train_fold[val_ix]
+        X_interior_val = X_interior_train_fold[val_ix]
+        flow_interior_val = flow_interior_train_fold[val_ix]
 
         # Initialize models
         pinn = PINN_FlowSolver(hidden_dim=128, num_layers=4).to(device)
@@ -520,28 +538,26 @@ def main():
         optimizer_wss = optim.Adam(wss_pred_net.parameters(), lr=1e-4)
         wss_mse = nn.MSELoss()
 
-        best_val_loss = float('inf')
-        best_pinn_state = None
-        best_wss_state = None
-        patience_counter = 0
-        val_loss_avg = float('inf')
-
         pinn_loss_fn = PINN_Loss(pinn, device, rho=RHO, mu=MU)
 
-        # Training epochs
-        for epoch in range(PINN_EPOCHS):
-            pinn.train()
-            wss_pred_net.train()
+        # ====================================================================
+        # Stage 1: train the PINN flow solver alone, to convergence, on
+        # physics + Poiseuille supervision only. No WSS network involved yet.
+        # ====================================================================
+        best_phys_val = float('inf')
+        best_pinn_state = None
+        patience_counter = 0
 
+        for epoch in range(STAGE1_EPOCHS):
+            pinn.train()
             train_losses = []
             pinn_loss_log = []
 
             for _ in range(PINN_STEPS_PER_EPOCH):
-                # === Physics: mix PATIENTS_PER_BATCH patients into this one
-                # gradient step (each at its own random time) so the update
-                # direction reflects several geometries at once, instead of
-                # one patient's field dominating the step and the next
-                # step's patient yanking it somewhere else. ===
+                # Mix PATIENTS_PER_BATCH patients into this one gradient step
+                # (each at its own random time) so the update direction
+                # reflects several geometries at once, instead of one
+                # patient's field dominating the step.
                 batch_patients = np.random.randint(0, len(X_train_inner), size=PATIENTS_PER_BATCH)
 
                 wall_parts, interior_parts, u_sup_parts = [], [], []
@@ -576,10 +592,95 @@ def main():
                     xyz_wall_t, xyz_interior_t, u_supervised
                 )
 
-                # === WSS prediction loss ===
-                # Feature = wall shear RATE (dU/dn), not raw velocity, since
-                # velocity at the wall is driven to ~0 by no-slip. Same
-                # multi-patient batching as above, for the same reason.
+                optimizer_pinn.zero_grad()
+                pinn_total.backward()
+                torch.nn.utils.clip_grad_norm_(pinn.parameters(), 1.0)
+                optimizer_pinn.step()
+
+                train_losses.append(pinn_total.item())
+                pinn_loss_log.append((wall_l.item(), cont_l.item(), ns_l.item(), flow_l.item()))
+
+            # Physics-only validation on held-out patients - no WSS labels
+            # involved, this only checks the flow solver generalizes.
+            # Subsampled to the same per-patient point counts a training
+            # step uses (not the full surface/interior sets): the 2nd-
+            # derivative NS residual is expensive, and validating on ~9
+            # patients at full size would cost several times more compute
+            # than a whole training epoch.
+            pinn.eval()
+            phys_val_losses = []
+            for i in range(len(X_val)):
+                time_idx = np.random.randint(0, INLET_TIMESTEPS)
+                t_norm = time_idx / INLET_TIMESTEPS
+
+                wall_pt_idx = np.random.choice(NUM_SURFACE_POINTS, WALL_POINTS_PER_PATIENT, replace=False)
+                xyz_wall_val = np.concatenate([
+                    X_val[i][wall_pt_idx], np.full((WALL_POINTS_PER_PATIENT, 1), t_norm)
+                ], axis=1).astype(np.float32)
+                xyz_wall_val_t = torch.tensor(xyz_wall_val, device=device, requires_grad=True)
+
+                interior_idx = np.random.choice(NUM_INTERIOR_POINTS, NS_POINTS_PER_PATIENT, replace=False)
+                xyz_interior_val = np.concatenate([
+                    X_interior_val[i][interior_idx], np.full((NS_POINTS_PER_PATIENT, 1), t_norm)
+                ], axis=1).astype(np.float32)
+                xyz_interior_val_t = torch.tensor(xyz_interior_val, device=device, requires_grad=True)
+
+                u_supervised_val = torch.tensor(
+                    flow_interior_val[i][interior_idx, time_idx, :], device=device, dtype=torch.float32
+                )
+
+                val_total, _, _, _, _ = pinn_loss_fn.total_loss(
+                    xyz_wall_val_t, xyz_interior_val_t, u_supervised_val
+                )
+                phys_val_losses.append(val_total.item())
+
+            phys_val_avg = np.mean(phys_val_losses)
+
+            if epoch % 10 == 0 and len(pinn_loss_log) > 0:
+                pinn_logs_arr = np.array(pinn_loss_log)
+                wall_avg, cont_avg, ns_avg, flow_avg = np.mean(pinn_logs_arr, axis=0)
+                logging.info(f"[Stage 1] Epoch {epoch:3d}: train={np.mean(train_losses):.6f}, "
+                           f"Wall={wall_avg:.6f}, Cont={cont_avg:.6f}, NS={ns_avg:.6f}, Flow={flow_avg:.6f}, "
+                           f"phys_val={phys_val_avg:.6f}")
+
+            if phys_val_avg < best_phys_val:
+                best_phys_val = phys_val_avg
+                best_pinn_state = {k: v.detach().clone() for k, v in pinn.state_dict().items()}
+                patience_counter = 0
+            else:
+                patience_counter += 1
+
+            if patience_counter >= STAGE1_PATIENCE:
+                logging.info(f"[Stage 1] Early stopping at epoch {epoch}")
+                break
+
+        if best_pinn_state is not None:
+            pinn.load_state_dict(best_pinn_state)
+
+        # Freeze the PINN: Stage 2 learns from its now-stable flow field
+        # instead of continuing to tune it, so the WSS predictor's regression
+        # target stops moving underneath it every step. compute_wall_shear_
+        # feature only needs requires_grad on the input coordinates (not the
+        # model's parameters) to compute the spatial gradient, so freezing
+        # here doesn't break it.
+        for p in pinn.parameters():
+            p.requires_grad = False
+        pinn.eval()
+
+        # ====================================================================
+        # Stage 2: train the WSS predictor on the frozen PINN's wall shear
+        # feature, using the real WSS labels.
+        # ====================================================================
+        best_val_loss = float('inf')
+        best_wss_state = None
+        patience_counter = 0
+        val_loss_avg = float('inf')
+
+        for epoch in range(STAGE2_EPOCHS):
+            wss_pred_net.train()
+            train_losses = []
+
+            for _ in range(PINN_STEPS_PER_EPOCH):
                 wss_batch_patients = np.random.randint(0, len(X_train_inner), size=PATIENTS_PER_BATCH)
 
                 wss_xyz_parts, wss_normal_parts, wss_y_parts = [], [], []
@@ -607,29 +708,18 @@ def main():
                 ).unsqueeze(1)
                 wss_loss = wss_mse(wss_pred_out, y_wss_t)
 
-                # Combined loss with scaling (avoid physics loss from dominating)
-                pinn_scaled = pinn_total * 0.1
-                total_loss = pinn_scaled + wss_loss
-
-                # Backprop
-                optimizer_pinn.zero_grad()
                 optimizer_wss.zero_grad()
-                total_loss.backward()
-                torch.nn.utils.clip_grad_norm_(pinn.parameters(), 1.0)
+                wss_loss.backward()
                 torch.nn.utils.clip_grad_norm_(wss_pred_net.parameters(), 1.0)
-                optimizer_pinn.step()
                 optimizer_wss.step()
 
-                train_losses.append(total_loss.item())
-                pinn_loss_log.append((wall_l.item(), cont_l.item(), ns_l.item(), flow_l.item()))
+                train_losses.append(wss_loss.item())
 
-            # Validation on val set (sample to save time)
-            pinn.eval()
+            # Validation over the FULL val set (previously a noisy 5-patient
+            # sample, which made the early-stopping decision itself noisy).
             wss_pred_net.eval()
             val_wss_loss = 0
-            val_n = min(len(X_val), 5)
-            val_idx = np.random.choice(len(X_val), val_n, replace=False)
-            for i in val_idx:
+            for i in range(len(X_val)):
                 pt_idx = np.random.choice(NUM_SURFACE_POINTS, 256, replace=False)
                 xyz_val = np.concatenate([X_val[i, pt_idx], np.zeros((256, 1))], axis=1).astype(np.float32)
                 xyz_val_t = torch.tensor(xyz_val, device=device)
@@ -642,32 +732,24 @@ def main():
                 wss_val_true = Y_val[i, pt_idx]
                 val_wss_loss += np.mean((wss_val_pred - wss_val_true) ** 2)
 
-            val_loss_avg = val_wss_loss / len(val_idx)
+            val_loss_avg = val_wss_loss / len(X_val)
 
-            if epoch % 10 == 0 and len(pinn_loss_log) > 0:
-                pinn_logs_arr = np.array(pinn_loss_log)
-                wall_avg, cont_avg, ns_avg, flow_avg = np.mean(pinn_logs_arr, axis=0)
-                logging.info(f"Epoch {epoch:3d}: train={np.mean(train_losses):.6f}, "
-                           f"Wall={wall_avg:.6f}, Cont={cont_avg:.6f}, NS={ns_avg:.6f}, Flow={flow_avg:.6f}, "
+            if epoch % 10 == 0:
+                logging.info(f"[Stage 2] Epoch {epoch:3d}: train_WSS={np.mean(train_losses):.6f}, "
                            f"val_WSS={val_loss_avg:.6f}")
 
-            # Early stopping
             if val_loss_avg < best_val_loss:
                 best_val_loss = val_loss_avg
-                best_pinn_state = {k: v.detach().clone() for k, v in pinn.state_dict().items()}
                 best_wss_state = {k: v.detach().clone() for k, v in wss_pred_net.state_dict().items()}
                 patience_counter = 0
             else:
                 patience_counter += 1
 
-            if patience_counter >= PINN_PATIENCE:
-                logging.info(f"Early stopping at epoch {epoch}")
+            if patience_counter >= STAGE2_PATIENCE:
+                logging.info(f"[Stage 2] Early stopping at epoch {epoch}")
                 break
 
-        # Test evaluation: restore the best-validated weights, not whatever
-        # state training happened to be in when patience ran out.
-        if best_pinn_state is not None:
-            pinn.load_state_dict(best_pinn_state)
+        if best_wss_state is not None:
             wss_pred_net.load_state_dict(best_wss_state)
 
         logging.info("\nEvaluating on test set...")
