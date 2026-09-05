@@ -755,6 +755,46 @@ def main():
         pinn.eval()
 
         # ====================================================================
+        # Calibrate WHICH point in the cardiac cycle Y's "instantaneous WSS"
+        # was taken at - Y never says, and it need not be t=0. Scan candidate
+        # times and keep whichever one makes the frozen flow field's raw
+        # shear feature correlate best with the true WSS on training
+        # patients, before Stage 2's MLP has been trained on anything - if
+        # the flow field is any good, its shear feature should already track
+        # WSS reasonably well at the right phase and much less well off it.
+        # ====================================================================
+        calib_patients = np.random.choice(len(X_train_inner), min(10, len(X_train_inner)), replace=False)
+        best_calib_time = 0
+        best_calib_score = -np.inf
+        for cand_time in range(0, INLET_TIMESTEPS, max(1, INLET_TIMESTEPS // 10)):
+            t_norm = cand_time / INLET_TIMESTEPS
+            scores = []
+            for p in calib_patients:
+                cond = build_cond(
+                    Z_train_inner[p, cand_time], vessel_radii_train_inner[p],
+                    flow_directions_train_inner[p], NUM_SURFACE_POINTS
+                )
+                xyz = np.concatenate([
+                    X_train_inner[p], np.full((NUM_SURFACE_POINTS, 1), t_norm), cond
+                ], axis=1).astype(np.float32)
+                xyz_t = torch.tensor(xyz, device=device)
+                cand_normals_t = torch.tensor(normals_train_inner[p], device=device, dtype=torch.float32)
+
+                shear = compute_wall_shear_feature(pinn, xyz_t, cand_normals_t).squeeze(1).cpu().numpy()
+                y_true = Y_train_inner[p]
+                if shear.std() > 1e-8 and y_true.std() > 1e-8:
+                    score_p = compute_pearson(y_true, shear)
+                    if np.isfinite(score_p):
+                        scores.append(score_p)
+
+            if scores and np.median(scores) > best_calib_score:
+                best_calib_score = np.median(scores)
+                best_calib_time = cand_time
+
+        logging.info(f"Calibrated WSS reference time: index {best_calib_time}/{INLET_TIMESTEPS} "
+                     f"(shear-vs-Y correlation={best_calib_score:.4f})")
+
+        # ====================================================================
         # Stage 2: train the WSS predictor on the frozen PINN's wall shear
         # feature, using the real WSS labels.
         # ====================================================================
@@ -773,13 +813,13 @@ def main():
                 wss_xyz_parts, wss_normal_parts, wss_y_parts = [], [], []
                 for p in wss_batch_patients:
                     wss_cond = build_cond(
-                        Z_train_inner[p, 0], vessel_radii_train_inner[p],
+                        Z_train_inner[p, best_calib_time], vessel_radii_train_inner[p],
                         flow_directions_train_inner[p], WSS_POINTS_PER_PATIENT
                     )
                     wss_pt_idx = np.random.choice(NUM_SURFACE_POINTS, WSS_POINTS_PER_PATIENT, replace=False)
                     wss_xyz_parts.append(np.concatenate([
                         X_train_inner[p][wss_pt_idx],
-                        np.zeros((WSS_POINTS_PER_PATIENT, 1)),  # t=0
+                        np.full((WSS_POINTS_PER_PATIENT, 1), best_calib_time / INLET_TIMESTEPS),
                         wss_cond
                     ], axis=1))
                     wss_normal_parts.append(normals_train_inner[p][wss_pt_idx])
@@ -812,9 +852,11 @@ def main():
             wss_pred_net.eval()
             val_wss_loss = 0
             for i in range(len(X_val)):
-                val_cond = build_cond(Z_val[i, 0], vessel_radii_val[i], flow_directions_val[i], 256)
+                val_cond = build_cond(Z_val[i, best_calib_time], vessel_radii_val[i], flow_directions_val[i], 256)
                 pt_idx = np.random.choice(NUM_SURFACE_POINTS, 256, replace=False)
-                xyz_val = np.concatenate([X_val[i, pt_idx], np.zeros((256, 1)), val_cond], axis=1).astype(np.float32)
+                xyz_val = np.concatenate([
+                    X_val[i, pt_idx], np.full((256, 1), best_calib_time / INLET_TIMESTEPS), val_cond
+                ], axis=1).astype(np.float32)
                 xyz_val_t = torch.tensor(xyz_val, device=device)
                 val_normals_t = torch.tensor(normals_val[i, pt_idx], device=device, dtype=torch.float32)
 
@@ -852,9 +894,11 @@ def main():
         test_wss_true = []
 
         for i in range(len(X_test)):
-            test_cond = build_cond(Z_test[i, 0], vessel_radii_test[i], flow_directions_test[i], NUM_SURFACE_POINTS)
+            test_cond = build_cond(
+                Z_test[i, best_calib_time], vessel_radii_test[i], flow_directions_test[i], NUM_SURFACE_POINTS
+            )
             xyz_test = np.concatenate([
-                X_test[i], np.zeros((NUM_SURFACE_POINTS, 1)), test_cond
+                X_test[i], np.full((NUM_SURFACE_POINTS, 1), best_calib_time / INLET_TIMESTEPS), test_cond
             ], axis=1).astype(np.float32)
             xyz_test_t = torch.tensor(xyz_test, device=device)
             test_normals_t = torch.tensor(normals_test[i], device=device, dtype=torch.float32)
