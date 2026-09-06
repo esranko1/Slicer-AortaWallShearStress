@@ -4,9 +4,10 @@ Two-Stage PINN for WSS Prediction from Point Clouds.
 Stage 1: Physics-Informed Neural Network (PINN)
   Input: Surface point cloud (4096 surface points) + inlet velocity BC
   Learn: u, v, w, p solving Navier-Stokes equations
-  Enforce: Continuity (∇·u=0), Momentum (ρ∂u/∂t + ρu·∇u = -∇p + μ∇²u)
-           Boundary conditions: wall no-slip (u=0) on the surface,
-           Poiseuille-flow supervision + NS residual in the interior
+  Enforce: Continuity (∇·u=0), Momentum (ρ∂u/∂t + ρu·∇u = -∇p + μ∇²u) at all
+           interior points; wall no-slip (u=0) on the surface; Poiseuille-
+           flow supervision only near the (heuristically identified) inlet
+           end of the vessel, not forced across the whole interior
 
 Stage 2: WSS Prediction (Supervised)
   Input: Surface geometry + wall shear rate (tangential viscous traction) from Stage 1
@@ -59,6 +60,10 @@ PINN_LR = 1e-3
 WALL_POINTS_PER_PATIENT = NUM_SURFACE_POINTS // PATIENTS_PER_BATCH
 NS_POINTS_PER_PATIENT = NS_SUBSAMPLE // PATIENTS_PER_BATCH
 WSS_POINTS_PER_PATIENT = NUM_SURFACE_POINTS // PATIENTS_PER_BATCH
+
+INLET_AXIAL_PERCENTILE = 15  # % of each patient's interior points, nearest the inlet end, that get
+                             # the Poiseuille supervision target - the rest is governed by NS + no-slip
+                             # alone, instead of being forced to look like a straight pipe everywhere.
 
 # Patient conditioning: [inlet_velocity_at_t, vessel_radius, flow_dir_x,
 # flow_dir_y, flow_dir_z], appended to every point fed to the PINN. Without
@@ -393,19 +398,30 @@ class PINN_Loss:
 
         return ns_loss, cont_loss, torch.cat([u, v, w], dim=1)
 
-    def total_loss(self, xyz_wall, xyz_interior, u_supervised_target):
+    def total_loss(self, xyz_wall, xyz_interior, u_supervised_target, inlet_mask):
         """
         xyz_wall: (batch, 4 + COND_DIM) - all surface points; the vessel
                   wall, so no-slip (u=0) applies everywhere here.
-        xyz_interior: (batch, 4 + COND_DIM) - points inside the lumen; NS
-                  residual and Poiseuille supervision both apply here.
-        u_supervised_target: (batch, 3) - Poiseuille flow target at xyz_interior
+        xyz_interior: (batch, 4 + COND_DIM) - points inside the lumen; the
+                  NS residual + continuity apply to ALL of them.
+        u_supervised_target: (batch, 3) - Poiseuille flow target at
+                  xyz_interior, only meaningful where inlet_mask is True.
+        inlet_mask: (batch,) bool - which xyz_interior points are near the
+                  inlet end of the vessel and get pulled toward the
+                  Poiseuille profile. Real vessels are curved/branching, not
+                  straight pipes, so everywhere else is left to the NS
+                  residual + no-slip alone rather than forced into a
+                  straight-pipe shape throughout the whole interior.
         """
         flow_wall = self.model(xyz_wall)
         wall_loss = torch.mean(flow_wall[:, 0:3]**2)
 
         ns_loss, cont_loss, uvw_interior = self.navier_stokes_loss(xyz_interior)
-        supervised_loss = torch.mean((uvw_interior - u_supervised_target)**2)
+
+        if inlet_mask.any():
+            supervised_loss = torch.mean((uvw_interior[inlet_mask] - u_supervised_target[inlet_mask])**2)
+        else:
+            supervised_loss = torch.zeros((), device=xyz_interior.device)
 
         total = (W_WALL_BC * wall_loss +
                  W_CONTINUITY * cont_loss +
@@ -498,19 +514,25 @@ def main():
     normals = np.zeros_like(X)
     flow_directions = np.zeros((n_patients, 3), dtype=np.float32)
     vessel_radii = np.zeros(n_patients, dtype=np.float32)
+    axial_positions = np.zeros((n_patients, NUM_SURFACE_POINTS), dtype=np.float32)
+    radial_distances = np.zeros((n_patients, NUM_SURFACE_POINTS), dtype=np.float32)
     X_interior_all = np.zeros((n_patients, NUM_INTERIOR_POINTS, 3), dtype=np.float32)
     interior_radial_all = np.zeros((n_patients, NUM_INTERIOR_POINTS), dtype=np.float32)
+    interior_idx_all = np.zeros((n_patients, NUM_INTERIOR_POINTS), dtype=np.int64)
 
     for i in range(n_patients):
         normals[i] = compute_normals(X[i], k=10)
-        flow_dir, _, radial_dist, vessel_r = compute_flow_geometry(X[i])
+        flow_dir, axial_pos, radial_dist, vessel_r = compute_flow_geometry(X[i])
         flow_directions[i] = flow_dir
         vessel_radii[i] = vessel_r
+        axial_positions[i] = axial_pos
+        radial_distances[i] = radial_dist
 
         if X[i].shape[0] >= NUM_INTERIOR_POINTS:
             idx = np.random.choice(X[i].shape[0], NUM_INTERIOR_POINTS, replace=False)
         else:
             idx = np.random.choice(X[i].shape[0], NUM_INTERIOR_POINTS, replace=True)
+        interior_idx_all[i] = idx
 
         interior_pts, interior_radial = generate_interior_points(
             X[i][idx], normals[i][idx], radial_dist[idx]
@@ -535,7 +557,42 @@ def main():
     consensus_direction = ref_eigvecs[:, -1]
     flip_mask = (flow_directions @ consensus_direction) < 0
     flow_directions[flip_mask] *= -1
+    axial_positions[flip_mask] *= -1  # keep axial position consistent with the now-flipped direction
     logging.info(f"Flow direction sign-consistency: flipped {flip_mask.sum()}/{n_patients} patients")
+
+    # Which end of the (now sign-consistent) flow axis is the inlet? This
+    # wall-only point cloud has no literal inlet-cap points to check
+    # directly. Real aortas taper from a wider proximal (inlet) segment to
+    # a narrower distal one, so use a radius-vs-axial-position correlation
+    # aggregated across patients as the convention: negative means radius
+    # shrinks as axial position increases, i.e. the LOW-axial-position end
+    # is the wider/inlet end.
+    taper_correlations = [
+        compute_pearson(axial_positions[i], radial_distances[i])
+        for i in range(n_patients)
+        if axial_positions[i].std() > 1e-8 and radial_distances[i].std() > 1e-8
+    ]
+    mean_taper_corr = np.mean(taper_correlations) if taper_correlations else 0.0
+    inlet_is_low_axial = mean_taper_corr <= 0
+    logging.info(f"Vessel taper check: mean radius-vs-axial-position correlation={mean_taper_corr:.4f}, "
+                 f"assuming inlet at {'low' if inlet_is_low_axial else 'high'}-axial-position end")
+
+    # Only interior points near that end get the Poiseuille supervision
+    # target; the rest of the interior is governed by the NS residual +
+    # continuity alone, instead of the whole interior being forced to look
+    # like a straight pipe (real vessels are curved/branching, not that).
+    interior_axial_all = np.zeros((n_patients, NUM_INTERIOR_POINTS), dtype=np.float32)
+    inlet_mask_all = np.zeros((n_patients, NUM_INTERIOR_POINTS), dtype=bool)
+    for i in range(n_patients):
+        interior_axial_all[i] = axial_positions[i][interior_idx_all[i]]
+        if inlet_is_low_axial:
+            threshold = np.percentile(interior_axial_all[i], INLET_AXIAL_PERCENTILE)
+            inlet_mask_all[i] = interior_axial_all[i] <= threshold
+        else:
+            threshold = np.percentile(interior_axial_all[i], 100 - INLET_AXIAL_PERCENTILE)
+            inlet_mask_all[i] = interior_axial_all[i] >= threshold
+    logging.info(f"Inlet region: targeting {INLET_AXIAL_PERCENTILE}% of interior points per patient "
+                 f"(actual mean {inlet_mask_all.mean() * 100:.1f}%)")
 
     # Precompute Poiseuille flow supervision at the interior points (not at
     # the wall, where the profile is ~0 by definition and just duplicates
@@ -569,6 +626,7 @@ def main():
 
         X_interior_train_fold = X_interior_all[train_ix]
         flow_interior_train_fold = flow_poiseuille_interior[train_ix]
+        inlet_mask_train_fold = inlet_mask_all[train_ix]
         normals_train_fold = normals[train_ix]
         normals_test = normals[test_ix]
         Z_train_fold = Z[train_ix]
@@ -588,6 +646,7 @@ def main():
         Y_train_inner = Y_train[train_ix_inner]
         X_interior_train = X_interior_train_fold[train_ix_inner]
         flow_train_inner = flow_interior_train_fold[train_ix_inner]
+        inlet_mask_train_inner = inlet_mask_train_fold[train_ix_inner]
         normals_train_inner = normals_train_fold[train_ix_inner]
         Z_train_inner = Z_train_fold[train_ix_inner]
         vessel_radii_train_inner = vessel_radii_train_fold[train_ix_inner]
@@ -597,6 +656,7 @@ def main():
         normals_val = normals_train_fold[val_ix]
         X_interior_val = X_interior_train_fold[val_ix]
         flow_interior_val = flow_interior_train_fold[val_ix]
+        inlet_mask_val = inlet_mask_train_fold[val_ix]
         Z_val = Z_train_fold[val_ix]
         vessel_radii_val = vessel_radii_train_fold[val_ix]
         flow_directions_val = flow_directions_train_fold[val_ix]
@@ -631,7 +691,7 @@ def main():
                 # patient's field dominating the step.
                 batch_patients = np.random.randint(0, len(X_train_inner), size=PATIENTS_PER_BATCH)
 
-                wall_parts, interior_parts, u_sup_parts = [], [], []
+                wall_parts, interior_parts, u_sup_parts, inlet_mask_parts = [], [], [], []
                 for p in batch_patients:
                     time_idx = np.random.randint(0, INLET_TIMESTEPS)
                     t_norm = time_idx / INLET_TIMESTEPS
@@ -658,6 +718,7 @@ def main():
                         interior_cond
                     ], axis=1))
                     u_sup_parts.append(flow_train_inner[p][interior_idx, time_idx, :])
+                    inlet_mask_parts.append(inlet_mask_train_inner[p][interior_idx])
 
                 xyz_wall = np.concatenate(wall_parts, axis=0).astype(np.float32)
                 xyz_wall_t = torch.tensor(xyz_wall, device=device, requires_grad=True)
@@ -668,9 +729,12 @@ def main():
                 u_supervised = torch.tensor(
                     np.concatenate(u_sup_parts, axis=0), device=device, dtype=torch.float32
                 )
+                inlet_mask_t = torch.tensor(
+                    np.concatenate(inlet_mask_parts, axis=0), device=device, dtype=torch.bool
+                )
 
                 pinn_total, wall_l, cont_l, ns_l, flow_l = pinn_loss_fn.total_loss(
-                    xyz_wall_t, xyz_interior_t, u_supervised
+                    xyz_wall_t, xyz_interior_t, u_supervised, inlet_mask_t
                 )
 
                 optimizer_pinn.zero_grad()
@@ -715,9 +779,12 @@ def main():
                 u_supervised_val = torch.tensor(
                     flow_interior_val[i][interior_idx, time_idx, :], device=device, dtype=torch.float32
                 )
+                inlet_mask_val_t = torch.tensor(
+                    inlet_mask_val[i][interior_idx], device=device, dtype=torch.bool
+                )
 
                 val_total, _, _, _, _ = pinn_loss_fn.total_loss(
-                    xyz_wall_val_t, xyz_interior_val_t, u_supervised_val
+                    xyz_wall_val_t, xyz_interior_val_t, u_supervised_val, inlet_mask_val_t
                 )
                 phys_val_losses.append(val_total.item())
 
