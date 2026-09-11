@@ -37,7 +37,7 @@ VELOCITY_DIM = 50
 # non-negativity) trains stably and looks directionally promising before committing to
 # the full run's wall-clock cost. Fold filenames encode N_FOLDS, so quick-test and
 # full-run results never collide on disk.
-QUICK_TEST = True
+QUICK_TEST = False
 
 if QUICK_TEST:
     N_FOLDS = 3
@@ -75,32 +75,9 @@ ROI_REGIONS = {
     "desc": slice(60, 96),   # Descending Aorta
     "abda": slice(96, 128),  # Abdominal Aorta
 }
-ROI_NAME = "arch"
+ROI_NAME = "pasc"
 ROI_LONGITUDINAL_SLICE = ROI_REGIONS[ROI_NAME]
-
-# Cascade experiment: condition the current region's model on an upstream region's own
-# specialist predictions (e.g. train Thoracic Arch with a hint of what Proximal
-# Ascending predicted). Physically motivated — WSS downstream depends on flow arriving
-# from upstream — but conditions on the upstream specialist's genuinely held-out
-# (K-fold out-of-fold) predictions, never its ground truth: at inference on a new
-# patient you'd only ever have the upstream model's *prediction*, never the true value,
-# so training must match that or the model would learn to rely on a signal it won't
-# have in deployment.
-USE_UPSTREAM_CONDITIONING = True
-UPSTREAM_REGION = "pasc"
-UPSTREAM_RESULTS_PATH = f"../experiments/6_PointNet_Velocity_roi_{UPSTREAM_REGION}/results.npz"
-UPSTREAM_BOUNDARY_COL = 35  # last column of pasc's ROI (0:36) — immediately upstream of arch's start (36:60)
-UPSTREAM_CONDITIONING_MODE = "rich"  # "boundary" (single column, already tested — no benefit)
-                                      # or "rich" (full-region summary: per-row mean + boundary + trend)
-
-if USE_UPSTREAM_CONDITIONING:
-    assert ROI_NAME != UPSTREAM_REGION, "Upstream conditioning region must differ from the region being trained"
-
-RESULTS_DIR = ("../experiments/6_PointNet_Velocity"
-               + ("_geo" if USE_GEOMETRIC_FEATURES else "")
-               + (f"_roi_{ROI_NAME}" if USE_ROI_LOSS else "")
-               + (f"_upstream_{UPSTREAM_REGION}" if USE_UPSTREAM_CONDITIONING else "")
-               + (f"_{UPSTREAM_CONDITIONING_MODE}" if USE_UPSTREAM_CONDITIONING and UPSTREAM_CONDITIONING_MODE != "boundary" else ""))
+RESULTS_DIR = "../experiments/6_PointNet_Velocity" + ("_geo" if USE_GEOMETRIC_FEATURES else "") + (f"_roi_{ROI_NAME}" if USE_ROI_LOSS else "")
 
 def set_seed(seed=SEED):
     torch.manual_seed(seed)
@@ -441,68 +418,6 @@ def train_one_fold(X_train, Y_train, Z_train, X_test, Y_test, Z_test, device, fo
     return final_pred.cpu().numpy(), best_val_loss, best_state
 
 
-def _build_upstream_channel(n_total, y_min, y_max):
-    """
-    Builds per-point conditioning channel(s) from an upstream specialist's genuinely
-    held-out (K-fold out-of-fold) predictions, reordered from results.npz's pooled
-    fold-iteration order back into original patient-index order by replicating the
-    identical KFold split (same SEED/N_FOLDS/n_total) that specialist was trained
-    with — this only produces a valid channel if UPSTREAM_RESULTS_PATH's run used the
-    same data and split as the current one.
-
-    UPSTREAM_CONDITIONING_MODE controls how much of the upstream region gets used:
-      - "boundary": only the single column immediately upstream of the current ROI
-        (UPSTREAM_BOUNDARY_COL), broadcast per row across all 128 columns. Already
-        tested (see experimental log, Model 12) — no benefit.
-      - "rich": three per-row channels built from the FULL upstream ROI, not just one
-        column — the region's mean (overall upstream level), its boundary-column value
-        (near-field), and a trend term (boundary minus the region's first column,
-        capturing whether WSS was rising or falling toward the boundary). Each is
-        broadcast across all 128 longitudinal columns, constant along that axis.
-
-    Level channels (mean, boundary) are scaled like Y_scaled: (val - y_min)/(y_max -
-    y_min). The trend channel is a difference of two WSS values, not an absolute level,
-    so it's scaled by dividing by the same range only (no y_min shift) — shifting a
-    difference by y_min would not be a meaningful transform.
-
-    Returns: (n_total, 4096, k) float32 array — k=1 for "boundary", k=3 for "rich".
-    """
-    upstream = np.load(UPSTREAM_RESULTS_PATH)
-    upstream_pred_pooled = upstream["all_pred"]  # (n_total, 4096), pooled KFold order
-
-    kf_upstream = KFold(n_splits=N_FOLDS, shuffle=True, random_state=SEED)
-    pooled_to_original = []
-    for _, test_ix in kf_upstream.split(np.arange(n_total)):
-        pooled_to_original.extend(test_ix.tolist())
-
-    original_to_pooled = np.empty(n_total, dtype=int)
-    for pooled_idx, orig_idx in enumerate(pooled_to_original):
-        original_to_pooled[orig_idx] = pooled_idx
-    upstream_pred_orig = upstream_pred_pooled[original_to_pooled]
-    upstream_grid = upstream_pred_orig.reshape(n_total, 32, 128)
-
-    boundary = upstream_grid[:, :, UPSTREAM_BOUNDARY_COL]  # (n_total, 32)
-
-    if UPSTREAM_CONDITIONING_MODE == "boundary":
-        level_rows = [boundary]
-        delta_rows = []
-    elif UPSTREAM_CONDITIONING_MODE == "rich":
-        upstream_roi = upstream_grid[:, :, ROI_REGIONS[UPSTREAM_REGION]]  # (n_total, 32, roi_width)
-        region_mean = upstream_roi.mean(axis=2)          # (n_total, 32)
-        region_first_col = upstream_roi[:, :, 0]          # (n_total, 32)
-        trend = boundary - region_first_col               # (n_total, 32)
-        level_rows = [region_mean, boundary]
-        delta_rows = [trend]
-    else:
-        raise ValueError(f"Unknown UPSTREAM_CONDITIONING_MODE: {UPSTREAM_CONDITIONING_MODE!r}")
-
-    y_range = y_max - y_min
-    channels = [(row - y_min) / y_range for row in level_rows] + [row / y_range for row in delta_rows]
-
-    broadcast_channels = [np.repeat(c[:, :, None], 128, axis=2).reshape(n_total, -1) for c in channels]
-    return np.stack(broadcast_channels, axis=-1).astype(np.float32)
-
-
 # ---------------------------------------------------------------------------
 # Main — 10-fold CV, matching the PI's original evaluation methodology.
 # ---------------------------------------------------------------------------
@@ -527,29 +442,19 @@ def main():
     Z = a[:, 0, 3:].astype(np.float32)           # (100, 50)
     Y = b[:, :, 0].astype(np.float32)            # (100, 4096)
 
-    # Scale Y to [0, 1] for training stability; inverse-transform for reporting. Computed
-    # early since USE_UPSTREAM_CONDITIONING below needs y_min/y_max to scale its channel
-    # consistently with Y_scaled.
-    y_min, y_max = Y.min(), Y.max()
-    Y_scaled = (Y - y_min) / (y_max - y_min)
-
     if USE_GEOMETRIC_FEATURES:
         geo = np.load(GEOMETRIC_FEATURES_PATH)  # (100, 4096, 7): x,y,z,nx,ny,nz,dist
         geo_feats = geo[:, :, 3:7].astype(np.float32)  # [nx, ny, nz, dist]
         X = np.concatenate([X, geo_feats], axis=2)  # (100, 4096, 7)
         logging.info(f"Using geometric features from {GEOMETRIC_FEATURES_PATH}")
-
-    if USE_UPSTREAM_CONDITIONING:
-        upstream_channels = _build_upstream_channel(X.shape[0], y_min, y_max)
-        X = np.concatenate([X, upstream_channels], axis=2)
-        logging.info(f"Using upstream conditioning from {UPSTREAM_RESULTS_PATH} "
-                     f"(region={UPSTREAM_REGION}, mode={UPSTREAM_CONDITIONING_MODE}, "
-                     f"channels={upstream_channels.shape[-1]})")
-
     input_channels = X.shape[-1]
 
     logging.info(f"X: {X.shape}, Z: {Z.shape}, Y: {Y.shape}")
     logging.info(f"Y range: [{Y.min():.4f}, {Y.max():.4f}]")
+
+    # Scale Y to [0, 1] for training stability; inverse-transform for reporting.
+    y_min, y_max = Y.min(), Y.max()
+    Y_scaled = (Y - y_min) / (y_max - y_min)
 
     kf = KFold(n_splits=N_FOLDS, shuffle=True, random_state=SEED)
 
