@@ -1,9 +1,8 @@
 """
 PI's original PointNet architecture (shape -> WSS), ported from TensorFlow/Keras to
-PyTorch. Shape-only (velocity ablation): predictions depend on geometry alone, not flow.
-
-ABLATION MODE: Testing whether inlet velocity waveform helps or hurts. This version
-removes the velocity encoder to establish a baseline for comparison.
+PyTorch, with the inlet velocity waveform encoded through a small dense (Linear) MLP
+and fused into the global shape feature, so predictions depend on both geometry and
+flow condition, not shape alone.
 
 Kept from the original: the learned input/feature transformation (alignment) blocks,
 the SSIM-based loss, early stopping + best-checkpoint restoration, 10-fold CV.
@@ -179,16 +178,25 @@ class AortaPointNetVelocity(nn.Module):
         self.conv512 = ConvBlock(128, 512)
         self.conv2048 = ConvBlock(512, 2048)
 
-        # Velocity ablation: no velocity_encoder (shape-only PointNet)
-        seg_input_channels = 64 + 128 + 128 + 128 + 512 + 2048
+        # Encode the inlet velocity waveform into an embedding that gets fused with
+        # the global shape feature — per PI direction: just a couple of dense layers,
+        # no conv/attention machinery over the waveform itself.
+        self.velocity_encoder = nn.Sequential(
+            nn.Linear(velocity_dim, 64),
+            nn.SiLU(),
+            nn.Linear(64, 128),
+            nn.SiLU(),
+        )
+
+        seg_input_channels = 64 + 128 + 128 + 128 + 512 + (2048 + 128)
         self.seg_conv128 = ConvBlock(seg_input_channels, 128)
         self.seg_conv64 = ConvBlock(128, 64)
         self.seg_conv32 = ConvBlock(64, 32)
         self.pred_head = nn.Conv1d(32, 1, kernel_size=1)
         self.pred_act = nn.SiLU()
 
-    def forward(self, points, velocity=None):
-        # points: (batch, num_points, input_channels), velocity: unused (ablation: shape-only)
+    def forward(self, points, velocity):
+        # points: (batch, num_points, input_channels), velocity: (batch, velocity_dim)
         x = points.transpose(1, 2)  # (batch, input_channels, num_points)
         num_points = x.shape[2]
 
@@ -200,8 +208,10 @@ class AortaPointNetVelocity(nn.Module):
         f512 = self.conv512(f_transformed)
         f2048 = self.conv2048(f512)
 
-        global_feat = f2048.max(dim=2)[0]              # (batch, 2048)
-        global_broadcast = global_feat.unsqueeze(2).expand(-1, -1, num_points)
+        global_feat = f2048.max(dim=2)[0]               # (batch, 2048)
+        vel_embed = self.velocity_encoder(velocity)      # (batch, 128)
+        global_combined = torch.cat([global_feat, vel_embed], dim=1)  # (batch, 2176)
+        global_broadcast = global_combined.unsqueeze(2).expand(-1, -1, num_points)
 
         seg_input = torch.cat([f64, f128_1, f128_2, f_transformed, f512, global_broadcast], dim=1)
         s = self.seg_conv128(seg_input)
@@ -425,7 +435,12 @@ def train_one_fold(X_train, Y_train, Z_train, X_test, Y_test, Z_test, device, fo
 def main():
     set_seed()
     os.makedirs(RESULTS_DIR, exist_ok=True)
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    if torch.cuda.is_available():
+        device = torch.device('cuda')
+    elif torch.backends.mps.is_available():
+        device = torch.device('mps')  # Apple Silicon GPU (Metal), e.g. M-series Macs
+    else:
+        device = torch.device('cpu')
     logging.info(f"Device: {device}")
     if device.type == 'cuda':
         logging.info(f"GPU Name: {torch.cuda.get_device_name(0)}")
@@ -433,6 +448,8 @@ def main():
         logging.info(f"CUDA Version: {torch.version.cuda}")
         logging.info(f"GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
         torch.cuda.empty_cache()
+    elif device.type == 'mps':
+        logging.info("Using Apple MPS (Metal) backend")
     else:
         logging.warning("⚠️  RUNNING ON CPU — This will be slow!")
 
