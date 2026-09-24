@@ -435,7 +435,12 @@ def train_one_fold(X_train, Y_train, Z_train, X_test, Y_test, Z_test, device, fo
 def main():
     set_seed()
     os.makedirs(RESULTS_DIR, exist_ok=True)
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    if torch.cuda.is_available():
+        device = torch.device('cuda')
+    elif torch.backends.mps.is_available():
+        device = torch.device('mps')  # Apple Silicon GPU (Metal), e.g. M-series Macs
+    else:
+        device = torch.device('cpu')
     logging.info(f"Device: {device}")
     if device.type == 'cuda':
         logging.info(f"GPU Name: {torch.cuda.get_device_name(0)}")
@@ -443,6 +448,8 @@ def main():
         logging.info(f"CUDA Version: {torch.version.cuda}")
         logging.info(f"GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
         torch.cuda.empty_cache()
+    elif device.type == 'mps':
+        logging.info("Using Apple MPS (Metal) backend")
     else:
         logging.warning("⚠️  RUNNING ON CPU — This will be slow!")
 
