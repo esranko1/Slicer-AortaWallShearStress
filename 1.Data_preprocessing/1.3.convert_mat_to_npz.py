@@ -27,10 +27,13 @@ def main():
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
     # --- Step 1: load the .mat file -----------------------------------------
+    # Use the "real" variants throughout — confirmed these are the corrected
+    # versions that should have been used for training all along, not the plain
+    # X/Z/SWSS (which this script previously loaded by mistake).
     mat = loadmat(MAT_FILE_PATH)
-    X = mat["X"]                # shape (100, 4096, 3)
-    Z = mat["Z"]                 # shape (100, 50)
-    SWSS = mat["SWSS"]           # shape (100, 4096)
+    X = mat["Xreal"]             # shape (100, 4096, 3)
+    Z = mat["Zreal"]             # shape (100, 50)
+    SWSS = mat["SWSSreal"]       # shape (100, 4096)
     TAWSS = mat["TAWSSreal"]     # shape (100, 4096)
 
     print("Loaded shapes:")
