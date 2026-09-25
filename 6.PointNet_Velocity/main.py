@@ -74,7 +74,7 @@ ROI_REGIONS = {
     "desc": slice(60, 96),   # Descending Aorta
     "abda": slice(96, 128),  # Abdominal Aorta
 }
-ROI_NAME = "pasc"
+ROI_NAME = "arch"
 ROI_LONGITUDINAL_SLICE = ROI_REGIONS[ROI_NAME]
 RESULTS_DIR = "../experiments/6_PointNet_Velocity" + ("_geo" if USE_GEOMETRIC_FEATURES else "") + (f"_roi_{ROI_NAME}" if USE_ROI_LOSS else "")
 
