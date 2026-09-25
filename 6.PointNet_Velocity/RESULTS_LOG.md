@@ -9,7 +9,7 @@ Velocity encoder (dense-layer fusion) is present in all runs below.
 | Region | Patient Pearson | Region Spearman | Whole-vessel Pearson | Whole-vessel Spearman | CCC | Notes |
 |---|---|---|---|---|---|---|
 | Proximal Ascending (pasc) | 0.901 | 0.752 | 0.671 | 0.644 | 0.600 | current project focus |
-| Thoracic Arch (arch) | — | — | — | — | — | pending |
+| Thoracic Arch (arch) | 0.752 | 0.714 | 0.640 | 0.652 | 0.611 | current project focus for this run |
 | Descending Aorta (desc) | — | — | — | — | — | pending |
 | Abdominal Aorta (abda) | — | — | — | — | — | pending |
 | Composite (stitched) | — | — | — | — | — | pending — run `stitch_specialists.py` once all 4 done |
