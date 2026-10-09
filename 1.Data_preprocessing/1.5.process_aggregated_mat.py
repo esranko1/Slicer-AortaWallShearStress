@@ -34,10 +34,10 @@ Velocity planes - what the .mat does NOT store, and what this script estimates:
     1. Plane j -> fractional centerline frame f_j = a + j*(b-a)/35, with (a, b)
        chosen so lumen pixel area best correlates with the beas cross-section
        area pi*mean(rho^2).
-    2. Pixel size from the mean (voxel area / pixel area) ratio.
-    3. In-plane orientation: the one of 8 flips/rotations of the image axes
-       that best overlaps the lumen mask with the rho(theta) cross-section,
-       shared by all planes of a patient.
+    2. Pixel area from the mean (voxel area / pixel area) ratio.
+    3. In-plane orientation (one of 8 flips/rotations of the image axes) and
+       row/col pixel aspect ratio: the pair that best overlaps the lumen mask
+       with the rho(theta) cross-section, shared by all planes of a patient.
   The fit quality (area correlation, mean IoU) is written to the manifest -
   review low values before training. If the real plane geometry becomes
   available, replace estimate_plane_geometry().
@@ -78,6 +78,9 @@ VEL_TO_MS = 0.01  # cm/s -> m/s
 
 REQUIRED_FIELDS = ('WSS', 'Vel', 'Ao_Seg')
 PATIENT_ID_RE = re.compile(r'\d{1,3}[A-Za-z]{1,4}\d{3,6}')
+
+# Candidate row/col pixel-size ratios (log-spaced, includes 1.0)
+PIXEL_ASPECTS = np.exp(np.linspace(np.log(0.4), np.log(2.5), 21))
 
 # The 8 flips/rotations of a 2D image's (row, col) axes, as (swap, flip_row, flip_col)
 DIHEDRAL = [(s, fr, fc) for s in (False, True) for fr in (False, True) for fc in (False, True)]
@@ -178,13 +181,14 @@ def interp_rho(rho, f):
     return (1 - w) * rho[i0] + w * rho[i1]
 
 
-def plane_pixel_offsets(shape, lumen, transform):
-    """In-plane (u, v) offsets in pixels of every grid pixel from the lumen
-    centroid, after applying one of the DIHEDRAL axis transforms."""
+def plane_pixel_offsets(shape, lumen, transform, row_size, col_size):
+    """In-plane (u, v) offsets in voxels of every grid pixel from the lumen
+    centroid, given the pixel size along image rows / columns (voxels), after
+    applying one of the DIHEDRAL axis transforms."""
     swap, flip_r, flip_c = transform
     rr, cc = np.meshgrid(np.arange(shape[0]), np.arange(shape[1]), indexing='ij')
     r0, c0 = rr[lumen].mean(), cc[lumen].mean()
-    dr, dc = rr - r0, cc - c0
+    dr, dc = (rr - r0) * row_size, (cc - c0) * col_size
     if flip_r:
         dr = -dr
     if flip_c:
@@ -192,9 +196,9 @@ def plane_pixel_offsets(shape, lumen, transform):
     return (dc, dr) if swap else (dr, dc)
 
 
-def rasterize_cross_section(u, v, rho_k, theta, pixel_size):
-    """Mask of pixels inside the rho(theta) cross-section; u, v in pixels."""
-    r = np.hypot(u, v) * pixel_size
+def rasterize_cross_section(u, v, rho_k, theta):
+    """Mask of pixels inside the rho(theta) cross-section; u, v in voxels."""
+    r = np.hypot(u, v)
     ang = np.mod(np.arctan2(v, u), 2 * np.pi)
     th = np.concatenate([theta, [2 * np.pi]])
     rh = np.concatenate([rho_k, rho_k[:1]])
@@ -225,23 +229,36 @@ def estimate_plane_geometry(seg, lumens):
     area_corr, a, b = best
     frame_pos = np.linspace(a, b, n)
     areas = np.interp(frame_pos, np.arange(K), section_area)
-    pixel_size = float(np.sqrt(np.mean(areas / npx)))  # voxels per pixel
+    pixel_size = float(np.sqrt(np.mean(areas / npx)))  # voxels per pixel (geometric mean of row/col)
 
-    ious = np.zeros((len(DIHEDRAL), n))
-    for t_idx, transform in enumerate(DIHEDRAL):
-        for j, lumen in enumerate(lumens):
-            u, v = plane_pixel_offsets(lumen.shape, lumen, transform)
-            section = rasterize_cross_section(u, v, interp_rho(rho, frame_pos[j]), theta, pixel_size)
-            ious[t_idx, j] = (section & lumen).sum() / max((section | lumen).sum(), 1)
-    best_t = int(np.argmax(ious.mean(axis=1)))
+    # Pixels need not be square (the non-10MC cohort has row spacing ~0.6x the
+    # column spacing), so fit the row/col aspect jointly with the transform,
+    # keeping the pixel area fixed at pixel_size**2.
+    sections = [interp_rho(rho, f) for f in frame_pos]
+    results = []  # (mean IoU, aspect, transform)
+    for transform in DIHEDRAL:
+        for aspect in PIXEL_ASPECTS:
+            row_size, col_size = pixel_size * np.sqrt(aspect), pixel_size / np.sqrt(aspect)
+            ious = []
+            for lumen, rho_k in zip(lumens, sections):
+                u, v = plane_pixel_offsets(lumen.shape, lumen, transform, row_size, col_size)
+                section = rasterize_cross_section(u, v, rho_k, theta)
+                ious.append((section & lumen).sum() / max((section | lumen).sum(), 1))
+            results.append((float(np.mean(ious)), float(aspect), transform))
+    results.sort(key=lambda r: -r[0])
+    mean_iou, aspect, transform = results[0]
+    runner_up = next(r[0] for r in results if r[2] != transform)
 
     return {
         'frame_pos': frame_pos,
         'pixel_size_vox': pixel_size,
-        'transform': DIHEDRAL[best_t],
+        'row_size_vox': pixel_size * np.sqrt(aspect),
+        'col_size_vox': pixel_size / np.sqrt(aspect),
+        'pixel_aspect': aspect,
+        'transform': transform,
         'area_corr': float(area_corr),
-        'mean_iou': float(ious[best_t].mean()),
-        'iou_margin': float(ious[best_t].mean() - np.sort(ious.mean(axis=1))[-2]),
+        'mean_iou': mean_iou,
+        'iou_margin': mean_iou - runner_up,
     }
 
 
@@ -285,8 +302,9 @@ def process_patient(struct):
     plane_origin, plane_normal = [], []
     for j, (plane, lumen) in enumerate(zip(planes, lumens)):
         origin, e0, e1, e2 = interp_frames(frames, geo['frame_pos'][j])
-        u, v = plane_pixel_offsets(lumen.shape, lumen, geo['transform'])
-        u, v = u[lumen] * geo['pixel_size_vox'], v[lumen] * geo['pixel_size_vox']
+        u, v = plane_pixel_offsets(lumen.shape, lumen, geo['transform'],
+                                   geo['row_size_vox'], geo['col_size_vox'])
+        u, v = u[lumen], v[lumen]
         xyz = origin[None, :] + u[:, None] * e0[None, :] + v[:, None] * e1[None, :]
         vel_xyz.append(xyz * mm)
         vel_normal.append(np.tile(e2, (len(u), 1)))
@@ -337,7 +355,10 @@ def process_patient(struct):
         inlet_flow_rate=inlet_flow_rate.astype(np.float32),
         mm_per_voxel=np.float32(mm),
         landmarks_xyz=(np.asarray(seg.landmarks, dtype=np.float64) * mm).astype(np.float32),
-        landmark_types=np.asarray(seg.typeL),
+        # typeL only exists in the 10MC-14MC cohort; the other cohort has
+        # untyped landmarks (and a different count), so -1 marks "unknown".
+        landmark_types=(np.asarray(seg.typeL) if hasattr(seg, 'typeL')
+                        else np.full(len(np.atleast_2d(seg.landmarks)), -1)).astype(np.int16),
         assumptions=np.array([
             "units: xyz mm, velocity m/s (Velo2D assumed cm/s), WSS Pa",
             "isotropic voxels: mm_per_voxel = lAortaMM / centerline arc length",
@@ -353,6 +374,8 @@ def process_patient(struct):
         n_wss_frames=wss_mag.shape[1],
         mm_per_voxel=round(mm, 4),
         pixel_size_mm=round(geo['pixel_size_vox'] * mm, 4),
+        pixel_row_mm=round(geo['row_size_vox'] * mm, 4),
+        pixel_col_mm=round(geo['col_size_vox'] * mm, 4),
         plane_frame_start=round(float(geo['frame_pos'][0]), 2),
         plane_frame_end=round(float(geo['frame_pos'][-1]), 2),
         area_corr=round(geo['area_corr'], 3),
