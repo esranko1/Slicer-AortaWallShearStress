@@ -8,8 +8,8 @@ name is NOT relied on - any top-level struct with WSS / Vel / Ao_Seg fields
 is accepted) containing:
     WSS.WSS_Norm3D        (128, 32, 50)     |WSS| on the surface grid, 50 frames
     WSS.WSS_Vect3D        (3, 128, 32, 50)  WSS vector
-    Vel{36}.Velo2D        (ny, nx, 18)      through-plane velocity on 36 planes,
-                                            18 cardiac phases, 0 outside lumen
+    Vel{36}.Velo2D        (ny, nx, P)       through-plane velocity on 36 planes,
+                                            P cardiac phases (varies), 0 outside lumen
     Ao_Seg.pts            (3, 128, 32)      surface grid (= 4096 points)
     Ao_Seg.mask           (Nx, Ny, Nz)      binary lumen mask
     Ao_Seg.beas           centerline (s), 64 local frames (orientationMatrix),
@@ -45,7 +45,7 @@ Velocity planes - what the .mat does NOT store, and what this script estimates:
 Units / timing assumptions (stored in each npz as `assumptions`):
   - Velo2D is in cm/s -> stored in m/s.  WSS assumed Pa.
   - Velocity phases and WSS frames both span exactly one cardiac cycle:
-    t_vel = k/18, t_wss = k/50.
+    t_vel = k/P, t_wss = k/T (P velocity phases, T WSS frames, read per file).
 
 Usage (on the Windows machine):
     python 1.5.process_aggregated_mat.py
@@ -56,6 +56,7 @@ import argparse
 import csv
 import hashlib
 import logging
+import traceback
 import re
 from pathlib import Path
 
@@ -70,9 +71,9 @@ DEFAULT_OUTPUT = str(Path(__file__).resolve().parent.parent / "Data" / "Processe
 
 N_AXIAL, N_CIRC = 128, 32
 N_SURFACE = N_AXIAL * N_CIRC
-N_WSS_FRAMES = 50
-N_VEL_PHASES = 18
 N_PLANES = 36
+# The number of velocity phases and WSS frames varies between patients, so both
+# are read from each file rather than fixed here.
 VEL_TO_MS = 0.01  # cm/s -> m/s
 
 REQUIRED_FIELDS = ('WSS', 'Vel', 'Ao_Seg')
@@ -270,6 +271,11 @@ def process_patient(struct):
 
     # --- velocity planes ----------------------------------------------------
     planes = [np.asarray(c.Velo2D, dtype=np.float64) for c in np.atleast_1d(vel)]
+    planes = [p[:, :, None] if p.ndim == 2 else p for p in planes]
+    phase_counts = sorted({p.shape[2] for p in planes})
+    if len(phase_counts) != 1:
+        raise ValueError(f"velocity planes have different numbers of phases: {phase_counts}")
+    n_vel_phases = phase_counts[0]
     if len(planes) != N_PLANES:
         logging.warning(f"    {len(planes)} velocity planes (expected {N_PLANES})")
     lumens = [np.isfinite(p).all(axis=2) & (p != 0).any(axis=2) for p in planes]
@@ -284,7 +290,7 @@ def process_patient(struct):
         xyz = origin[None, :] + u[:, None] * e0[None, :] + v[:, None] * e1[None, :]
         vel_xyz.append(xyz * mm)
         vel_normal.append(np.tile(e2, (len(u), 1)))
-        vel_values.append(plane[lumen] * VEL_TO_MS)  # (n_px, 18)
+        vel_values.append(plane[lumen] * VEL_TO_MS)  # (n_px, P)
         vel_plane_id.append(np.full(len(u), j, dtype=np.int16))
         plane_origin.append(origin * mm)
         plane_normal.append(e2)
@@ -298,14 +304,14 @@ def process_patient(struct):
     peak_phase = int(np.argmax(np.abs(plane0.mean(axis=0))))
     forward_sign_ok = bool(plane0[:, peak_phase].mean() > 0)
 
-    # Inlet waveform (mean through-plane velocity on plane 0), resampled to the
-    # 50 WSS frames for the legacy `Z` input.
-    t_vel = np.arange(N_VEL_PHASES) / N_VEL_PHASES
+    # Inlet waveform (mean through-plane velocity on plane 0), resampled to a
+    # fixed 50 samples for the legacy `Z` input (phase counts vary by patient).
+    t_vel = np.arange(n_vel_phases) / n_vel_phases
     t_wss = np.arange(wss_mag.shape[1]) / wss_mag.shape[1]
     inlet_mean = plane0.mean(axis=0)
-    inlet_waveform_50 = np.interp(t_wss, t_vel, inlet_mean, period=1.0)
+    inlet_waveform_50 = np.interp(np.arange(50) / 50, t_vel, inlet_mean, period=1.0)
     pixel_area_m2 = (geo['pixel_size_vox'] * mm * 1e-3) ** 2
-    inlet_flow_rate = plane0.sum(axis=0) * pixel_area_m2  # m^3/s, (18,)
+    inlet_flow_rate = plane0.sum(axis=0) * pixel_area_m2  # m^3/s, (P,)
 
     out = dict(
         surface_xyz=surface_xyz.astype(np.float32),
@@ -335,7 +341,7 @@ def process_patient(struct):
         assumptions=np.array([
             "units: xyz mm, velocity m/s (Velo2D assumed cm/s), WSS Pa",
             "isotropic voxels: mm_per_voxel = lAortaMM / centerline arc length",
-            "time: vel phase k -> t=k/18, WSS frame k -> t=k/50, one cardiac cycle",
+            f"time: vel phase k -> t=k/{n_vel_phases}, WSS frame k -> t=k/{wss_mag.shape[1]}, one cardiac cycle",
             "velocity plane positions/pixel size/in-plane orientation ESTIMATED (see manifest)",
         ]),
     )
@@ -343,6 +349,8 @@ def process_patient(struct):
         n_lumen_voxels=int(mask.sum()),
         n_vel_pixels=len(vel_values),
         n_planes=len(planes),
+        n_vel_phases=n_vel_phases,
+        n_wss_frames=wss_mag.shape[1],
         mm_per_voxel=round(mm, 4),
         pixel_size_mm=round(geo['pixel_size_vox'] * mm, 4),
         plane_frame_start=round(float(geo['frame_pos'][0]), 2),
@@ -438,7 +446,8 @@ def main():
                          f"area_corr={qc['area_corr']} IoU={qc['mean_iou']} "
                          f"in_lumen={qc['vel_px_in_lumen']} {row['note']}")
         except Exception as e:  # keep going; every failure ends up in the manifest
-            row.update(status='failed', note=f'{type(e).__name__}: {e}')
+            where = traceback.extract_tb(e.__traceback__)[-1]
+            row.update(status='failed', note=f'{type(e).__name__}: {e} (line {where.lineno}, {where.name})')
             logging.info(f"FAIL  {path.name}: {row['note']}")
         manifest.append(row)
 
