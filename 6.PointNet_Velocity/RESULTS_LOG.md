@@ -12,7 +12,7 @@ Velocity encoder (dense-layer fusion) is present in all runs below.
 | Thoracic Arch (arch) | 0.752 | 0.714 | 0.640 | 0.652 | 0.611 | current project focus for this run |
 | Descending Aorta (desc) | 0.721 | 0.658 | 0.724 | 0.671 | 0.681 | current project focus for this run |
 | Abdominal Aorta (abda) | 0.703 | 0.692 | 0.703 | 0.659 | 0.689 | current project focus for this run |
-| Composite (stitched) | — | — | — | — | — | pending — run `stitch_specialists.py` once all 4 done |
+| Composite (stitched) | 0.820 | — | 0.820 | 0.788 | 0.795 | whole-vessel; slope/intercept 0.639/0.196; beats 0.782 single-model baseline |
 
 ## Superseded (incorrect data: plain SWSS/X/Z — do not use for reporting)
 
