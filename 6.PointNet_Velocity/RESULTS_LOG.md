@@ -11,7 +11,7 @@ Velocity encoder (dense-layer fusion) is present in all runs below.
 | Proximal Ascending (pasc) | 0.901 | 0.752 | 0.671 | 0.644 | 0.600 | current project focus |
 | Thoracic Arch (arch) | 0.752 | 0.714 | 0.640 | 0.652 | 0.611 | current project focus for this run |
 | Descending Aorta (desc) | 0.721 | 0.658 | 0.724 | 0.671 | 0.681 | current project focus for this run |
-| Abdominal Aorta (abda) | — | — | — | — | — | pending |
+| Abdominal Aorta (abda) | 0.703 | 0.692 | 0.703 | 0.659 | 0.689 | current project focus for this run |
 | Composite (stitched) | — | — | — | — | — | pending — run `stitch_specialists.py` once all 4 done |
 
 ## Superseded (incorrect data: plain SWSS/X/Z — do not use for reporting)
