@@ -240,6 +240,63 @@ def relerr(pred, true):
     return float(np.linalg.norm(pred[ok] - true[ok]) / (np.linalg.norm(true[ok]) + 1e-12))
 
 
+# (key, description, higher_is_better) for the flow summary table
+FLOW_METRICS = [
+    ('relerr', 'Relative error |pred - meas| / |meas|, all phases', False),
+    ('relerr_systole', 'Relative error, systolic phases', False),
+    ('relerr_diastole', 'Relative error, diastolic phases (mostly noise)', False),
+    ('rmse_ms', 'RMSE (m/s)', False),
+    ('r_profile_peak', 'Pearson r, cross-section velocity profile at peak systole', True),
+    ('r_waveform', 'Pearson r, plane-mean velocity over the cardiac cycle', True),
+    ('r_all', 'Pearson r, all pixels x phases (inflated by systole vs diastole)', True),
+]
+
+
+def flow_metrics(pred, true, base, prep, plane_id):
+    """
+    Held-out-plane metrics for the PINN and for the neighbour-copy baseline,
+    as pinn_<key> / baseline_<key> for each key in FLOW_METRICS, plus the
+    PINN's error on the training planes. pred / true / base: (Npx, P),
+    normalised by U. The profile and waveform correlations are computed per
+    held-out plane and then the median is taken over planes.
+    """
+    val, sys_ = prep['is_val'], prep['systole']
+    peak = int(np.argmax(np.abs(true).mean(axis=0)))
+    out = {'train_relerr': relerr(pred[~val], true[~val])}
+    for name, p in (('pinn', pred), ('baseline', base)):
+        planes = [j for j in prep['val_planes'] if np.isfinite(p[plane_id == j]).all()]
+        profile = [pearson(p[plane_id == j, peak], true[plane_id == j, peak]) for j in planes]
+        waveform = [pearson(p[plane_id == j].mean(axis=0), true[plane_id == j].mean(axis=0)) for j in planes]
+        out.update({
+            f'{name}_relerr': relerr(p[val], true[val]),
+            f'{name}_relerr_systole': relerr(p[val][:, sys_], true[val][:, sys_]),
+            f'{name}_relerr_diastole': relerr(p[val][:, ~sys_], true[val][:, ~sys_]),
+            f'{name}_rmse_ms': float(np.sqrt(np.nanmean((p[val] - true[val]) ** 2)) * prep['U']),
+            f'{name}_r_profile_peak': float(np.nanmedian(profile)) if profile else np.nan,
+            f'{name}_r_waveform': float(np.nanmedian(waveform)) if waveform else np.nan,
+            f'{name}_r_all': pearson(p[val][np.isfinite(p[val])], true[val][np.isfinite(p[val])]),
+        })
+    return out
+
+
+def print_flow_summary(rows):
+    """Readable PINN-vs-baseline table over patients (medians, and how many
+    patients the PINN beats the baseline on)."""
+    rows = [r for r in rows if r.get('pinn_relerr') not in (None, '')]
+    if not rows:
+        return
+    logging.info(f"\nFlow reconstruction on HELD-OUT planes (every 6th measured plane, never trained on).")
+    logging.info(f"Baseline = average of the two neighbouring measured planes. Medians over {len(rows)} patients.\n")
+    logging.info(f"{'metric':64s} {'PINN':>7s} {'baseline':>9s}   PINN better in")
+    for key, desc, higher in FLOW_METRICS:
+        p = np.array([float(r[f'pinn_{key}']) for r in rows])
+        b = np.array([float(r[f'baseline_{key}']) for r in rows])
+        better = int(np.sum(p > b) if higher else np.sum(p < b))
+        logging.info(f"{desc:64s} {np.nanmedian(p):7.3f} {np.nanmedian(b):9.3f}   {better}/{len(rows)} patients")
+    train = np.array([float(r['train_relerr']) for r in rows])
+    logging.info(f"{'Relative error on the TRAINING planes (fit to the data it saw)':64s} {np.nanmedian(train):7.3f}")
+
+
 def through_plane_error(model, prep, mask, device, max_pts=20000, rng=None):
     """Relative L2 error of predicted vs measured through-plane velocity."""
     idx = np.flatnonzero(mask)
@@ -334,19 +391,8 @@ def export_patient(pid, d, model, prep, fit_s, args, device, out_dir):
     # --- flow reconstruction quality (the actual job of Stage 1) -----------
     pred = plane_predictions(model, prep, device)
     true = prep['vel']
-    val, sys_ = prep['is_val'], prep['systole']
     base = neighbour_plane_baseline(d, prep['val_planes']) / prep['U']
-    flow = dict(
-        train_relerr=relerr(pred[~val], true[~val]),
-        val_relerr=relerr(pred[val], true[val]),
-        val_relerr_systole=relerr(pred[val][:, sys_], true[val][:, sys_]),
-        val_relerr_diastole=relerr(pred[val][:, ~sys_], true[val][:, ~sys_]),
-        baseline_val_relerr=relerr(base[val], true[val]),
-        baseline_val_relerr_systole=relerr(base[val][:, sys_], true[val][:, sys_]),
-        # Absolute error in m/s, which is what matters in diastole
-        val_rmse_ms=float(np.sqrt(np.mean((pred[val] - true[val]) ** 2)) * prep['U']),
-        baseline_val_rmse_ms=float(np.sqrt(np.nanmean((base[val] - true[val]) ** 2)) * prep['U']),
-    )
+    flow = flow_metrics(pred, true, base, prep, d['vel_plane_id'])
 
     if args.export_field:
         P = prep['n_phases']
@@ -399,7 +445,8 @@ def export_patient(pid, d, model, prep, fit_s, args, device, out_dir):
                 'arch': dict(hidden=args.hidden, layers=args.layers, n_fourier=args.fourier, sigma=args.sigma,
                              n_harmonics=args.harmonics),
                 'centre_mm': prep['centre'], 'L_mm': prep['L_mm'], 'U': prep['U'],
-                'Re': prep['Re'], 'St': prep['St'], 'cycle_s': args.cycle_s},
+                'Re': prep['Re'], 'St': prep['St'], 'cycle_s': args.cycle_s,
+                'holdout_every': args.holdout_every, 'wall_offset_mm': args.wall_offset_mm},
                out_dir / f"{pid}.pt")
     return metrics
 
@@ -483,11 +530,10 @@ def main():
             d = load_patient(args.data, pid)
             model, prep, fit_s = fit_patient(pid, d, args, device)
             m = export_patient(pid, d, model, prep, fit_s, args, device, out_dir)
-            logging.info(f"  -> held-out planes: relerr {m['val_relerr']} (systole {m['val_relerr_systole']}, "
-                         f"diastole {m['val_relerr_diastole']}), RMSE {m['val_rmse_ms']} m/s | "
-                         f"neighbour-copy baseline: relerr {m['baseline_val_relerr']} "
-                         f"(systole {m['baseline_val_relerr_systole']}), RMSE {m['baseline_val_rmse_ms']} m/s | "
-                         f"train relerr {m['train_relerr']}")
+            logging.info(f"  -> held-out planes, PINN vs neighbour-copy baseline: "
+                         f"rel. error {m['pinn_relerr']} vs {m['baseline_relerr']}, "
+                         f"profile r {m['pinn_r_profile_peak']} vs {m['baseline_r_profile_peak']}, "
+                         f"waveform r {m['pinn_r_waveform']} vs {m['baseline_r_waveform']}")
             rows[pid] = m
         except Exception as e:  # keep the batch going; the error lands in the summary
             logging.exception(f"  FAILED {pid}: {e}")
@@ -501,13 +547,8 @@ def main():
             w.writeheader()
             w.writerows(rows.values())
 
-    done = [r for r in rows.values() if r.get('val_relerr') not in (None, '')]
-    if done:
-        for key in ('val_relerr', 'baseline_val_relerr', 'val_relerr_systole', 'baseline_val_relerr_systole',
-                    'val_relerr_diastole', 'val_rmse_ms', 'baseline_val_rmse_ms', 'train_relerr'):
-            vals = np.array([float(r[key]) for r in done], dtype=float)
-            logging.info(f"median {key}: {np.nanmedian(vals):.3f}")
-    logging.info(f"Summary: {summary_path}")
+    print_flow_summary(list(rows.values()))
+    logging.info(f"\nPer-patient results: {summary_path}")
 
 
 if __name__ == '__main__':
