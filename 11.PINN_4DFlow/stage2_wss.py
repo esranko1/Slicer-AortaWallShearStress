@@ -128,7 +128,9 @@ def main():
     pred_dir = results / "stage2_predictions"
     pred_dir.mkdir(parents=True, exist_ok=True)
 
-    patients = sorted(p.stem for p in stage1_dir.glob("*.npz"))
+    # Stage 1 also writes <id>_field.npz (the 3D velocity field); only the
+    # per-patient feature files <id>.npz count as patients here.
+    patients = sorted(p.stem for p in stage1_dir.glob("*.npz") if not p.stem.endswith("_field"))
     if len(patients) < args.folds:
         raise SystemExit(f"Only {len(patients)} patients have Stage 1 results in {stage1_dir}; "
                          f"need at least --folds={args.folds}")
