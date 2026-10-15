@@ -17,10 +17,17 @@ SWSS target), Pearson of time-averaged WSS (TAWSS), Pearson over all
 points x frames, and MAE in Pa. Reported overall and per cohort, on the whole
 wall and on the part covered by the velocity planes (within COVERED_MM).
 
+--drop-flow trains the same model WITHOUT the four Stage 1 flow features
+(PINN WSS, its axial/circumferential components, near-wall speed), i.e. on
+geometry + timing + inlet velocity only. Comparing it with the normal run shows
+how much the reconstructed flow actually contributes. Its results go to
+separate files (stage2_results_noflow.csv, stage2_predictions_noflow/).
+
 Requires stage1_flow_pinn.py to have finished for the patients used.
 
 Usage:
     python stage2_wss.py
+    python stage2_wss.py --drop-flow
     python stage2_wss.py --folds 5 --epochs 40
 """
 
@@ -43,6 +50,7 @@ logging.basicConfig(level=logging.INFO, format='%(message)s')
 
 FEATURES = ['pinn_wss', 'pinn_wss_axial', 'pinn_wss_circ', 'near_wall_speed', 'inlet_velocity',
             'phase_sin', 'phase_cos', 'local_radius_mm', 'axial_position', 'dist_to_plane_mm', 'cohort_other']
+FLOW_FEATURES = {'pinn_wss', 'pinn_wss_axial', 'pinn_wss_circ', 'near_wall_speed'}
 
 
 def patient_features(data_dir, stage1_dir, pid):
@@ -118,14 +126,20 @@ def main():
     ap.add_argument('--lr', type=float, default=1e-3)
     ap.add_argument('--patience', type=int, default=10)
     ap.add_argument('--device', default='auto')
+    ap.add_argument('--drop-flow', action='store_true',
+                    help='ablation: train without the Stage 1 flow features')
     args = ap.parse_args()
+
+    cols = [i for i, f in enumerate(FEATURES) if not (args.drop_flow and f in FLOW_FEATURES)]
+    tag = '_noflow' if args.drop_flow else ''
+    method_name = f'stage2{tag}'
 
     device = torch.device(args.device if args.device != 'auto' else ('cuda' if torch.cuda.is_available() else 'cpu'))
     rng = np.random.default_rng(args.seed)
     torch.manual_seed(args.seed)
     results = Path(args.results)
     stage1_dir = results / "stage1"
-    pred_dir = results / "stage2_predictions"
+    pred_dir = results / f"stage2_predictions{tag}"
     pred_dir.mkdir(parents=True, exist_ok=True)
 
     # Stage 1 also writes <id>_field.npz (the 3D velocity field); only the
@@ -135,6 +149,7 @@ def main():
         raise SystemExit(f"Only {len(patients)} patients have Stage 1 results in {stage1_dir}; "
                          f"need at least --folds={args.folds}")
     logging.info(f"{len(patients)} patients with Stage 1 results, {args.folds}-fold CV, device {device}")
+    logging.info(f"Features: {[FEATURES[i] for i in cols]}")
 
     # One pass over all patients to build a fixed random training pool each;
     # full feature tensors are recomputed per test patient at evaluation time.
@@ -160,12 +175,13 @@ def main():
         # A feature that is constant in this fold's training set (e.g. the
         # cohort flag when every training patient is from one cohort) keeps
         # sd=1, otherwise test patients from the other cohort explode.
+        # Linear calibration of the raw PINN WSS (feature 0), for the baseline MAE
+        a, b = np.polyfit(Xtr[:, 0], ytr, 1)
+        Xtr, Xva = Xtr[:, cols], Xva[:, cols]
+
         mu, sd = Xtr.mean(axis=0), Xtr.std(axis=0)
         sd = np.where(sd < 1e-3, 1.0, sd)
         y_mu, y_sd = ytr.mean(), ytr.std() + 1e-6
-
-        # Linear calibration of the raw PINN WSS (feature 0), for the baseline MAE
-        a, b = np.polyfit(Xtr[:, 0], ytr, 1)
 
         to = lambda arr: torch.from_numpy(np.ascontiguousarray(arr, dtype=np.float32)).to(device)  # noqa: E731
         Xtr_t, ytr_t = to((Xtr - mu) / sd), to((ytr - y_mu) / y_sd)
@@ -200,15 +216,15 @@ def main():
         for pid in test_ids:
             X, y, pinn, covered = patient_features(args.data, stage1_dir, pid)
             with torch.no_grad():
-                pred = model(to((X.reshape(-1, X.shape[-1]) - mu) / sd)).cpu().numpy()
+                pred = model(to((X.reshape(-1, X.shape[-1])[:, cols] - mu) / sd)).cpu().numpy()
             pred = (pred * y_sd + y_mu).reshape(y.shape)
             np.savez_compressed(pred_dir / f"{pid}.npz", pred=pred.astype(np.float32), label=y,
                                 pinn_raw=pinn, fold=fold)
-            for method, p in (('pinn_raw', a * pinn + b), ('stage2', pred)):
+            for method, p in (('pinn_raw', a * pinn + b), (method_name, pred)):
                 rows.append(dict(patient_id=pid, cohort=cohort_of(pid), fold=fold, method=method,
                                  **score(p, y), **{f"{k}_covered": v for k, v in score(p[covered], y[covered]).items()}))
 
-    out_csv = results / "stage2_results.csv"
+    out_csv = results / f"stage2_results{tag}.csv"
     with open(out_csv, 'w', newline='') as f:
         w = csv.DictWriter(f, fieldnames=list(rows[0]))
         w.writeheader()
@@ -216,17 +232,17 @@ def main():
 
     logging.info(f"\n{'=' * 72}\nPer-patient medians (Pearson r, MAE in Pa)\n{'=' * 72}")
     for cohort in ('all', 'MC', 'other'):
-        for method in ('pinn_raw', 'stage2'):
+        for method in ('pinn_raw', method_name):
             sel = [r for r in rows if r['method'] == method and (cohort == 'all' or r['cohort'] == cohort)]
             if not sel:
                 continue
             med = {k: np.nanmedian([r[k] for r in sel]) for k in sel[0] if k.startswith(('r_', 'mae'))}
-            logging.info(f"{cohort:6s} {method:9s} n={len(sel):3d}  r_peak={med['r_peak']:.3f}  "
+            logging.info(f"{cohort:6s} {method:13s} n={len(sel):3d}  r_peak={med['r_peak']:.3f}  "
                          f"r_tawss={med['r_tawss']:.3f}  r_all={med['r_all']:.3f}  MAE={med['mae_pa']:.3f}  | "
                          f"covered wall: r_peak={med['r_peak_covered']:.3f}  r_tawss={med['r_tawss_covered']:.3f}")
-    fold_med = [np.nanmedian([r['r_peak'] for r in rows if r['method'] == 'stage2' and r['fold'] == k])
+    fold_med = [np.nanmedian([r['r_peak'] for r in rows if r['method'] == method_name and r['fold'] == k])
                 for k in range(args.folds)]
-    logging.info(f"Stage 2 r_peak, mean of fold medians: {np.mean(fold_med):.4f} +/- {np.std(fold_med):.4f} "
+    logging.info(f"{method_name} r_peak, mean of fold medians: {np.mean(fold_med):.4f} +/- {np.std(fold_med):.4f} "
                  f"(comparable to 10.PINN_TwoStage's summary)")
     logging.info(f"Per-patient results: {out_csv}")
 
