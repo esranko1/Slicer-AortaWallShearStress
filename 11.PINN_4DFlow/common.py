@@ -98,3 +98,46 @@ def distance_to_planes(d):
     """Distance (mm) from each surface point to the nearest velocity-plane pixel."""
     dist, _ = cKDTree(d['vel_xyz']).query(d['surface_xyz'])
     return dist.astype(np.float32)
+
+
+def interp_frames(frames, f):
+    """Centerline frame (origin, e0, e1, e2) at fractional index f of the
+    (4, 4, K) orientationMatrix stack, re-orthonormalised. Same convention as
+    1.5.process_aggregated_mat.py: column 2 = tangent, column 3 = origin."""
+    K = frames.shape[2]
+    f = float(np.clip(f, 0, K - 1))
+    i0 = int(np.floor(f))
+    i1 = min(i0 + 1, K - 1)
+    w = f - i0
+    M = (1 - w) * frames[:, :, i0] + w * frames[:, :, i1]
+    e2 = M[:3, 2] / np.linalg.norm(M[:3, 2])
+    e0 = M[:3, 0] - (M[:3, 0] @ e2) * e2
+    e0 /= np.linalg.norm(e0)
+    e1 = np.cross(e2, e0)
+    if e1 @ M[:3, 1] < 0:
+        e1 = -e1
+    return M[:3, 3], e0, e1, e2
+
+
+def neighbour_plane_baseline(d, val_planes):
+    """
+    Trivial reference for held-out planes: copy the two neighbouring planes'
+    velocity (nearest pixel after aligning plane centroids) and average them.
+    A flow reconstruction is only useful if it beats this.
+    returns (Npx, P) prediction for pixels of val_planes (NaN elsewhere)
+    """
+    v, pid, xyz = d['vel_through_plane'], d['vel_plane_id'], d['vel_xyz']
+    pred = np.full_like(v, np.nan)
+    planes = set(np.unique(pid).tolist())
+    for j in val_planes:
+        m = pid == j
+        X = xyz[m] - xyz[m].mean(axis=0)
+        guesses = []
+        for jj in (j - 1, j + 1):
+            if jj in planes and jj not in set(val_planes):
+                mm = pid == jj
+                _, ix = cKDTree(xyz[mm] - xyz[mm].mean(axis=0)).query(X)
+                guesses.append(v[mm][ix])
+        if guesses:
+            pred[m] = np.mean(guesses, axis=0)
+    return pred
