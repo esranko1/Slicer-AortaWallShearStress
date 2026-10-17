@@ -11,6 +11,13 @@ untouched.
     --no-flow  ablation: drop the inlet velocity waveform input (geometry only)
     --seed     repeat runs with different seeds
     --pwv-weight  weight of the pulse wave velocity loss (default 1; 0 = WSS only)
+    --no-retrain  skip the retrain step below (report the epoch-selection model)
+
+Retrain step (default): per fold, the best epoch is first chosen on 10% of the
+training patients (validation). Then a fresh model is trained on ALL the
+fold's training patients (train + validation) for that many epochs, and only
+that model predicts the test patient(s). The test patients are never used for
+training, epoch choice or scaling.
 
 PWV: besides the WSS map, the model predicts one pulse wave velocity per
 patient (PWVreal from dataForPy9.mat, via extract_pwv.py), from the same global
@@ -84,6 +91,7 @@ _ap.add_argument("--cv", choices=["10", "loo"], default="10", help="10-fold or l
 _ap.add_argument("--no-flow", action="store_true", help="ablation: no inlet velocity input")
 _ap.add_argument("--seed", type=int, default=2024)
 _ap.add_argument("--pwv-weight", type=float, default=1.0, help="PWV loss weight; 0 = no PWV output")
+_ap.add_argument("--no-retrain", action="store_true", help="skip retraining on all training patients")
 ARGS = _ap.parse_args()
 
 if QUICK_TEST:
@@ -98,6 +106,7 @@ CV_LOO = ARGS.cv == "loo"
 USE_FLOW = not ARGS.no_flow
 PWV_WEIGHT = ARGS.pwv_weight
 USE_PWV = PWV_WEIGHT > 0
+RETRAIN = not ARGS.no_retrain
 PWV_PATH = "../Data/Sampled/pwv_N100.npz"  # from extract_pwv.py
 
 BATCH_SIZE = 16
@@ -132,7 +141,8 @@ VAL_FRACTION = 0.1  # share of each fold's training patients used to pick the be
 ROI_LONGITUDINAL_SLICE = ROI_REGIONS.get(ROI_NAME, slice(0, 128))
 RESULTS_DIR = (f"../experiments/14_Final_{ROI_NAME}_{'loo' if CV_LOO else 'cv10'}_"
                f"{'flow' if USE_FLOW else 'noflow'}" + (f"_seed{SEED}" if SEED != 2024 else "")
-               + ("" if PWV_WEIGHT == 1.0 else f"_pwvw{PWV_WEIGHT:g}"))
+               + ("" if PWV_WEIGHT == 1.0 else f"_pwvw{PWV_WEIGHT:g}")
+               + ("" if RETRAIN else "_noretrain"))
 
 def set_seed(seed=SEED):
     torch.manual_seed(seed)
@@ -426,6 +436,7 @@ def train_one_fold(X_train, Y_train, Z_train, X_val, Y_val, Z_val, X_test, Z_tes
     n_train = X_train_t.shape[0]
     start_epoch = 0
     best_val_loss = float('inf')
+    best_epoch = 0
     best_state = None
     epochs_without_train_improvement = 0
     best_train_loss = float('inf')
@@ -442,6 +453,7 @@ def train_one_fold(X_train, Y_train, Z_train, X_val, Y_val, Z_val, X_test, Z_tes
         start_epoch = checkpoint['epoch']
         best_val_loss = checkpoint['best_val_loss']
         best_state = checkpoint['best_state']
+        best_epoch = checkpoint.get('best_epoch', 0)
         best_train_loss = checkpoint['best_train_loss']
         epochs_without_train_improvement = checkpoint['epochs_without_train_improvement']
         logging.info(f"  Fold {fold_idx}: resuming mid-fold checkpoint at epoch {start_epoch}")
@@ -476,6 +488,7 @@ def train_one_fold(X_train, Y_train, Z_train, X_val, Y_val, Z_val, X_test, Z_tes
 
         if val_loss < best_val_loss:
             best_val_loss = val_loss
+            best_epoch = epoch
             best_state = copy.deepcopy(model.state_dict())
 
         if epoch_train_loss < best_train_loss - 1e-5:
@@ -496,6 +509,7 @@ def train_one_fold(X_train, Y_train, Z_train, X_val, Y_val, Z_val, X_test, Z_tes
                 'epoch': epoch + 1,
                 'best_val_loss': best_val_loss,
                 'best_state': best_state,
+                'best_epoch': best_epoch,
                 'best_train_loss': best_train_loss,
                 'epochs_without_train_improvement': epochs_without_train_improvement,
             }, resume_path)
@@ -515,7 +529,44 @@ def train_one_fold(X_train, Y_train, Z_train, X_val, Y_val, Z_val, X_test, Z_tes
         os.remove(resume_path)
 
     final_pwv = final_pwv.cpu().numpy() if final_pwv is not None else None
-    return final_pred.cpu().numpy(), final_pwv, best_val_loss, best_state
+    return final_pred.cpu().numpy(), final_pwv, best_val_loss, best_state, best_epoch
+
+
+def retrain_fixed_epochs(X_all, Y_all, Z_all, P_all, n_epochs, X_test, Z_test, device, fold_idx,
+                         input_channels=3):
+    """
+    Train a fresh model on all of the fold's training patients for a fixed number
+    of epochs (chosen beforehand on the validation patients), then predict the
+    test patients. No validation and no early stopping here: the epoch count is
+    already decided, so the test patients play no part in it.
+    """
+    torch.manual_seed(SEED + 1000 + fold_idx)
+    model = AortaPointNetVelocity(input_channels=input_channels, use_flow=USE_FLOW, use_pwv=USE_PWV).to(device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-5)
+    roi_slice = ROI_LONGITUDINAL_SLICE if USE_ROI_LOSS else None
+    to = lambda a: torch.tensor(a, dtype=torch.float32, device=device)  # noqa: E731
+    X_t, Y_t, Z_t = to(X_all), to(Y_all), to(Z_all)
+    P_t = to(P_all) if USE_PWV else None
+    n = X_t.shape[0]
+    for epoch in range(n_epochs):
+        model.train()
+        perm = torch.randperm(n)
+        for start in range(0, n, BATCH_SIZE):
+            idx = perm[start:start + BATCH_SIZE]
+            optimizer.zero_grad()
+            pred, m1, m2, pwv = model(X_t[idx], Z_t[idx])
+            loss = compute_loss(pred, Y_t[idx], m1, m2, roi_slice=roi_slice)
+            if USE_PWV:
+                loss = loss + pwv_loss(pwv, P_t[idx])
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP_NORM)
+            optimizer.step()
+        if epoch % 50 == 0:
+            logging.info(f"  Fold {fold_idx} retrain epoch {epoch}/{n_epochs}: train_loss={loss.item():.4f}")
+    model.eval()
+    with torch.no_grad():
+        pred, _, _, pwv = model(to(X_test), to(Z_test))
+    return pred.cpu().numpy(), (pwv.cpu().numpy() if pwv is not None else None), model.state_dict()
 
 
 # ---------------------------------------------------------------------------
@@ -587,6 +638,10 @@ def main():
         if os.path.exists(results_path):
             logging.info(f"\n=== Fold {fold_idx} === (already completed — loading cached results)")
             cached = np.load(results_path)
+            cached_retrained = bool(cached['retrained']) if 'retrained' in cached.files else False
+            if cached_retrained != RETRAIN:
+                raise SystemExit(f"{results_path} was made {'with' if not RETRAIN else 'without'} the retrain step; "
+                                 f"delete {RESULTS_DIR} (or use the matching --no-retrain setting) and rerun.")
             pred, true, fold_r2 = cached['pred'], cached['true'], float(cached['r2'])
             pwv_pred = cached['pwv_pred'] if 'pwv_pred' in cached.files else None
             pwv_true = cached['pwv_true'] if 'pwv_true' in cached.files else None
@@ -608,7 +663,7 @@ def main():
                 p_min, p_max = PWV[fit_ix].min(), PWV[fit_ix].max()
                 p_scale = lambda v: (v - p_min) / (p_max - p_min)  # noqa: E731
 
-            pred_scaled, pwv_scaled, best_val_loss, best_state = train_one_fold(
+            pred_scaled, pwv_scaled, best_val_loss, best_state, best_epoch = train_one_fold(
                 X[fit_ix], scale(Y[fit_ix]), Z[fit_ix],
                 X[val_ix], scale(Y[val_ix]), Z[val_ix],
                 X[test_ix], Z[test_ix],
@@ -616,6 +671,20 @@ def main():
                 P_train=p_scale(PWV[fit_ix]) if USE_PWV else None,
                 P_val=p_scale(PWV[val_ix]) if USE_PWV else None,
             )
+            if RETRAIN:
+                # Fresh model on all training patients (train + validation) for the
+                # chosen number of epochs; scaling now from all training patients.
+                n_epochs = best_epoch + 1
+                logging.info(f"  Best epoch {best_epoch} on validation -> retraining on all "
+                             f"{len(train_ix)} training patients for {n_epochs} epochs")
+                # scale / p_scale read y_min.. at call time, so they now use this range
+                y_min, y_max = Y[train_ix].min(), Y[train_ix].max()
+                if USE_PWV:
+                    p_min, p_max = PWV[train_ix].min(), PWV[train_ix].max()
+                pred_scaled, pwv_scaled, best_state = retrain_fixed_epochs(
+                    X[train_ix], scale(Y[train_ix]), Z[train_ix],
+                    p_scale(PWV[train_ix]) if USE_PWV else None,
+                    n_epochs, X[test_ix], Z[test_ix], device, fold_idx, input_channels=input_channels)
             pred = pred_scaled * (y_max - y_min) + y_min
             true = Y[test_ix]
             pwv_pred = pwv_scaled * (p_max - p_min) + p_min if USE_PWV else None
@@ -625,7 +694,8 @@ def main():
             # Save immediately — if the run gets interrupted later, this fold's work
             # is not lost, and a re-run will skip straight past it.
             extra = dict(pwv_pred=pwv_pred, pwv_true=pwv_true) if USE_PWV else {}
-            np.savez_compressed(results_path, pred=pred, true=true, r2=fold_r2, best_val_loss=best_val_loss, **extra)
+            np.savez_compressed(results_path, pred=pred, true=true, r2=fold_r2, best_val_loss=best_val_loss,
+                                best_epoch=best_epoch, retrained=RETRAIN, **extra)
             torch.save(best_state, fold_model_path(fold_idx))
             logging.info(f"Fold {fold_idx}: best_val_loss={best_val_loss:.4f}, R2={fold_r2:.4f} (saved to {results_path})")
 
