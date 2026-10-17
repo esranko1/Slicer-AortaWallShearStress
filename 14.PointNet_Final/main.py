@@ -62,6 +62,7 @@ with arrays:
 """
 
 import argparse
+import gc
 import os
 import copy
 import logging
@@ -698,6 +699,14 @@ def main():
                                 best_epoch=best_epoch, retrained=RETRAIN, **extra)
             torch.save(best_state, fold_model_path(fold_idx))
             logging.info(f"Fold {fold_idx}: best_val_loss={best_val_loss:.4f}, R2={fold_r2:.4f} (saved to {results_path})")
+
+            # Free this fold's models before the next one: with 100 leave-one-out
+            # folds, GPU memory that is not handed back promptly adds up.
+            del best_state, pred_scaled, pwv_scaled
+            gc.collect()
+            if device.type == 'cuda':
+                torch.cuda.empty_cache()
+                logging.info(f"  GPU memory after cleanup: {torch.cuda.memory_allocated() / 1e9:.2f} GB")
 
         # Whole-vessel R2 above no longer reflects what the model is optimized for once
         # USE_ROI_LOSS is on — it's expected to look bad/negative since the model isn't
