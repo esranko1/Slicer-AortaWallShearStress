@@ -643,6 +643,9 @@ def main():
             if cached_retrained != RETRAIN:
                 raise SystemExit(f"{results_path} was made {'with' if not RETRAIN else 'without'} the retrain step; "
                                  f"delete {RESULTS_DIR} (or use the matching --no-retrain setting) and rerun.")
+            if USE_FLOW and 'flow_scaled' not in cached.files:
+                raise SystemExit(f"{results_path} was made before the inlet-flow input was scaled; "
+                                 f"delete {RESULTS_DIR} and rerun.")
             pred, true, fold_r2 = cached['pred'], cached['true'], float(cached['r2'])
             pwv_pred = cached['pwv_pred'] if 'pwv_pred' in cached.files else None
             pwv_true = cached['pwv_true'] if 'pwv_true' in cached.files else None
@@ -659,15 +662,21 @@ def main():
             y_min, y_max = Y[fit_ix].min(), Y[fit_ix].max()
             scale = lambda v: (v - y_min) / (y_max - y_min)  # noqa: E731
 
+            # Inlet flow waveform scaled by its largest magnitude among the training
+            # patients (raw values reach the hundreds, which saturates the flow
+            # encoder). Shape and timing are unchanged.
+            z_max = float(np.abs(Z[fit_ix]).max()) or 1.0
+            z_scale = lambda v: v / z_max  # noqa: E731
+
             # PWV scaled with the training patients' range only, like WSS
             if USE_PWV:
                 p_min, p_max = PWV[fit_ix].min(), PWV[fit_ix].max()
                 p_scale = lambda v: (v - p_min) / (p_max - p_min)  # noqa: E731
 
             pred_scaled, pwv_scaled, best_val_loss, best_state, best_epoch = train_one_fold(
-                X[fit_ix], scale(Y[fit_ix]), Z[fit_ix],
-                X[val_ix], scale(Y[val_ix]), Z[val_ix],
-                X[test_ix], Z[test_ix],
+                X[fit_ix], scale(Y[fit_ix]), z_scale(Z[fit_ix]),
+                X[val_ix], scale(Y[val_ix]), z_scale(Z[val_ix]),
+                X[test_ix], z_scale(Z[test_ix]),
                 device, fold_idx, input_channels=input_channels,
                 P_train=p_scale(PWV[fit_ix]) if USE_PWV else None,
                 P_val=p_scale(PWV[val_ix]) if USE_PWV else None,
@@ -680,12 +689,13 @@ def main():
                              f"{len(train_ix)} training patients for {n_epochs} epochs")
                 # scale / p_scale read y_min.. at call time, so they now use this range
                 y_min, y_max = Y[train_ix].min(), Y[train_ix].max()
+                z_max = float(np.abs(Z[train_ix]).max()) or 1.0
                 if USE_PWV:
                     p_min, p_max = PWV[train_ix].min(), PWV[train_ix].max()
                 pred_scaled, pwv_scaled, best_state = retrain_fixed_epochs(
-                    X[train_ix], scale(Y[train_ix]), Z[train_ix],
+                    X[train_ix], scale(Y[train_ix]), z_scale(Z[train_ix]),
                     p_scale(PWV[train_ix]) if USE_PWV else None,
-                    n_epochs, X[test_ix], Z[test_ix], device, fold_idx, input_channels=input_channels)
+                    n_epochs, X[test_ix], z_scale(Z[test_ix]), device, fold_idx, input_channels=input_channels)
             pred = pred_scaled * (y_max - y_min) + y_min
             true = Y[test_ix]
             pwv_pred = pwv_scaled * (p_max - p_min) + p_min if USE_PWV else None
@@ -696,7 +706,7 @@ def main():
             # is not lost, and a re-run will skip straight past it.
             extra = dict(pwv_pred=pwv_pred, pwv_true=pwv_true) if USE_PWV else {}
             np.savez_compressed(results_path, pred=pred, true=true, r2=fold_r2, best_val_loss=best_val_loss,
-                                best_epoch=best_epoch, retrained=RETRAIN, **extra)
+                                best_epoch=best_epoch, retrained=RETRAIN, flow_scaled=True, **extra)
             torch.save(best_state, fold_model_path(fold_idx))
             logging.info(f"Fold {fold_idx}: best_val_loss={best_val_loss:.4f}, R2={fold_r2:.4f} (saved to {results_path})")
 
