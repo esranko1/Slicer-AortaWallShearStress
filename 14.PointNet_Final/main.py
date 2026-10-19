@@ -450,7 +450,8 @@ def train_one_fold(X_train, Y_train, Z_train, X_val, Y_val, Z_val, X_test, Z_tes
         checkpoint = torch.load(resume_path, map_location=device)
         model.load_state_dict(checkpoint['model_state'])
         optimizer.load_state_dict(checkpoint['optimizer_state'])
-        torch.set_rng_state(checkpoint['rng_state'])
+        # map_location moved everything to the GPU; the RNG state must stay a CPU ByteTensor
+        torch.set_rng_state(checkpoint['rng_state'].cpu())
         start_epoch = checkpoint['epoch']
         best_val_loss = checkpoint['best_val_loss']
         best_state = checkpoint['best_state']
