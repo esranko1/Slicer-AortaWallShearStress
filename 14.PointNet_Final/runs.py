@@ -4,6 +4,7 @@ predictions, build the four-region composite, and score both Pearson metrics.
 
 A run is named by a spec string  "<model>:<cv>:<flow>[:seed]"
     model  composite (the four specialists stitched) | whole (single model)
+           | meanmap | poiseuille | flowradius (baselines.py; cv10 only, flow ignored)
     cv     cv10 | loo
     flow   flow | noflow
     seed   optional, default 2024
@@ -25,14 +26,19 @@ REGIONS = {
 WHOLE = slice(0, 128)
 
 
+BASELINES = ("meanmap", "poiseuille", "flowradius")
+
+
 def results_path(region, cv, flow, seed):
+    if region in BASELINES:
+        return f"../experiments/15_Baselines_{cv}/{region}/results.npz"
     suffix = f"_seed{seed}" if seed != 2024 else ""
     return f"../experiments/14_Final_{region}_{cv}_{flow}{suffix}/results.npz"
 
 
 def parse_spec(spec):
     parts = spec.split(":")
-    if len(parts) not in (3, 4) or parts[0] not in ("composite", "whole") \
+    if len(parts) not in (3, 4) or parts[0] not in ("composite", "whole") + BASELINES \
             or parts[1] not in ("cv10", "loo") or parts[2] not in ("flow", "noflow"):
         raise SystemExit(f"Bad run spec '{spec}'; expected <composite|whole>:<cv10|loo>:<flow|noflow>[:seed]")
     return parts[0], parts[1], parts[2], int(parts[3]) if len(parts) == 4 else 2024
@@ -56,8 +62,8 @@ def load_run(spec):
     composite it is the mean of the four specialists' PWV predictions.
     """
     model, cv, flow, seed = parse_spec(spec)
-    if model == "whole":
-        d = np.load(results_path("whole", cv, flow, seed))
+    if model == "whole" or model in BASELINES:
+        d = np.load(results_path(model, cv, flow, seed))
         o = _order(d["all_true"])
         pt, pp = _pwv(d, o)
         return d["all_true"][o].reshape(-1, 32, 128), d["all_pred"][o].reshape(-1, 32, 128), pt, pp
