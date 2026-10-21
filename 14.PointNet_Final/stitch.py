@@ -10,6 +10,12 @@ Metrics:
              patients' overall WSS correctly)
   spatial r  each patient's Pearson across the wall points, median over
              patients (says whether the pattern on the wall is right)
+  MAE        mean absolute error over the region's wall points, in label units
+             (Pa), median over patients [IQR]
+  NMAE       MAE / that patient's true WSS range in the region, median [IQR]
+  pooled rho Spearman over all wall points of all patients (the PI notebook's
+             regional metric, for comparison with its baseline)
+  level BA   Bland-Altman of each patient's median regional WSS (Pa)
 Plus, for the whole vessel: Spearman, CCC, slope/intercept of the level values,
 and pulse wave velocity (r, MAE, Bland-Altman) when the run predicted it (for
 the composite: the mean of the four specialists' PWV predictions).
@@ -21,7 +27,8 @@ import os
 import numpy as np
 from scipy.stats import spearmanr
 
-from runs import REGIONS, WHOLE, level_values, load_run, r_level, r_spatial_per_patient, results_path
+from runs import (REGIONS, WHOLE, level_bland_altman, level_values, load_run, mae_per_patient,
+                  nmae_per_patient, pooled_spearman, r_level, r_spatial_per_patient, results_path)
 
 
 def ccc(t, p):
@@ -51,9 +58,21 @@ def main():
         print(f"\n=== {spec}  (N={n} patients) ===")
         print(f"Whole vessel: level r {r_level(true, pred, WHOLE):.3f}   Spearman {spearmanr(t, p)[0]:.3f}   "
               f"CCC {ccc(t, p):.3f}   slope/intercept {slope:.3f}/{intercept:.3f}")
-        print(f"{'region':8s} {'level r':>8s} {'spatial r (median)':>19s}")
-        for name, col in [("whole", WHOLE)] + list(REGIONS.items()):
-            print(f"{name:8s} {r_level(true, pred, col):8.3f} {np.median(r_spatial_per_patient(true, pred, col)):19.3f}")
+        rows = [("whole", WHOLE)] + list(REGIONS.items())
+        q = lambda v: f"{np.median(v):.3f} [{np.percentile(v, 25):.3f}-{np.percentile(v, 75):.3f}]"  # noqa: E731
+
+        print("\nPattern and error on the wall (per patient, median [IQR] over patients):")
+        print(f"{'region':8s} {'spatial r':>22s} {'MAE (Pa)':>22s} {'NMAE':>22s} {'pooled rho':>11s}")
+        for name, col in rows:
+            print(f"{name:8s} {q(r_spatial_per_patient(true, pred, col)):>22s} {q(mae_per_patient(true, pred, col)):>22s} "
+                  f"{q(nmae_per_patient(true, pred, col)):>22s} {pooled_spearman(true, pred, col):11.3f}")
+
+        print("\nPatient level (each patient's median regional WSS, across patients):")
+        print(f"{'region':8s} {'level r':>8s} {'bias (Pa)':>10s} {'95% limits of agreement (Pa)':>30s}")
+        for name, col in rows:
+            bias, lo, hi = level_bland_altman(true, pred, col)
+            print(f"{name:8s} {r_level(true, pred, col):8.3f} {bias:+10.3f} {f'[{lo:+.3f}, {hi:+.3f}]':>30s}")
+        print()
         if pwv_pred is not None:
             d = pwv_pred - pwv_true
             print(f"PWV: r {np.corrcoef(pwv_true, pwv_pred)[0, 1]:.3f}   MAE {np.abs(d).mean():.2f} m/s   "

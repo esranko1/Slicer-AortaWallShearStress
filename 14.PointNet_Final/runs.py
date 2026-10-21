@@ -100,3 +100,35 @@ def r_spatial_per_patient(true, pred, col):
     t = t - t.mean(axis=1, keepdims=True)
     p = p - p.mean(axis=1, keepdims=True)
     return (t * p).sum(axis=1) / (np.sqrt((t ** 2).sum(axis=1) * (p ** 2).sum(axis=1)) + 1e-12)
+
+
+def region_points(true, pred, col):
+    """(n, k) true and predicted WSS at the region's wall points."""
+    n = true.shape[0]
+    return true[:, :, col].reshape(n, -1), pred[:, :, col].reshape(n, -1)
+
+
+def mae_per_patient(true, pred, col):
+    """Mean absolute error over the region's wall points, per patient: (n,), in label units (Pa)."""
+    t, p = region_points(true, pred, col)
+    return np.abs(p - t).mean(axis=1)
+
+
+def nmae_per_patient(true, pred, col):
+    """MAE divided by that patient's true WSS range in the region (max - min): (n,), a fraction."""
+    t, p = region_points(true, pred, col)
+    return np.abs(p - t).mean(axis=1) / (t.max(axis=1) - t.min(axis=1) + 1e-12)
+
+
+def pooled_spearman(true, pred, col):
+    """The PI notebook's regional metric: Spearman over all wall points of all patients pooled."""
+    from scipy.stats import spearmanr
+    t, p = region_points(true, pred, col)
+    return float(spearmanr(t.ravel(), p.ravel())[0])
+
+
+def level_bland_altman(true, pred, col):
+    """Bias and 95% limits of agreement of each patient's median regional WSS (pred - true)."""
+    t, p = level_values(true, pred, col)
+    d = p - t
+    return float(d.mean()), float(d.mean() - 1.96 * d.std()), float(d.mean() + 1.96 * d.std())
