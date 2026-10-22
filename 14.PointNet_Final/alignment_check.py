@@ -98,12 +98,19 @@ def tortuosity(X):
 
 
 def match_rows(Y, true):
-    """Index into Y for each row of `true` (the run's patients, in its own order)."""
-    key = {np.round(row[:16], 6).tobytes(): i for i, row in enumerate(Y)}
-    idx = [key.get(np.round(row[:16], 6).tobytes()) for row in true]
-    if any(i is None for i in idx):
-        raise SystemExit("Could not match the run's patients to the data file; is it the same data?")
-    return np.array(idx)
+    """Index into Y for each row of `true` (the run's patients, in its own order).
+    Nearest row by distance: the run stored WSS in float32, the data is read as
+    float64, so exact comparison fails."""
+    Y32 = Y.astype(np.float32).astype(np.float64)
+    idx = np.zeros(len(true), dtype=int)
+    for k, row in enumerate(true.astype(np.float64)):
+        dist = np.abs(Y32 - row).max(axis=1)
+        idx[k] = int(np.argmin(dist))
+        if dist[idx[k]] > 1e-4:
+            raise SystemExit("Could not match the run's patients to the data file; is it the same data?")
+    if len(set(idx)) != len(idx):
+        raise SystemExit("Two of the run's patients matched the same data row; cannot pair them.")
+    return idx
 
 
 def main():
@@ -124,6 +131,9 @@ def main():
     print("3D orientation (rotation to the most typical patient):")
     print(f"  median {np.median(angles):.1f} deg, IQR {np.percentile(angles, 25):.1f}-{np.percentile(angles, 75):.1f}, "
           f"max {angles.max():.1f}; under 15 deg: {np.mean(angles < 15) * 100:.0f}% of patients")
+    edges = [0, 15, 30, 45, 60, 90, 180]
+    counts = np.histogram(angles, bins=edges)[0]
+    print("  patients per angle band: " + ", ".join(f"{lo}-{hi} deg: {c}" for lo, hi, c in zip(edges, edges[1:], counts)))
 
     true, pred, _, _ = load_run(args.run)
     order = match_rows(Y, true.reshape(len(true), -1))   # run row k -> data row order[k]
