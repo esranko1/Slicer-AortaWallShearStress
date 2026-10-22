@@ -4,6 +4,8 @@ predictions, build the four-region composite, and score both Pearson metrics.
 
 A run is named by a spec string  "<model>:<cv>:<flow>[:seed]"
     model  composite (the four specialists stitched) | whole (single model)
+           | hybrid (the pasc specialist on the proximal ascending aorta, the
+             whole-vessel model everywhere else; PWV from the whole model)
            | meanmap | poiseuille | flowradius (baselines.py; cv10 only, flow ignored)
     cv     cv10 | loo
     flow   flow | noflow
@@ -38,7 +40,7 @@ def results_path(region, cv, flow, seed):
 
 def parse_spec(spec):
     parts = spec.split(":")
-    if len(parts) not in (3, 4) or parts[0] not in ("composite", "whole") + BASELINES \
+    if len(parts) not in (3, 4) or parts[0] not in ("composite", "whole", "hybrid") + BASELINES \
             or parts[1] not in ("cv10", "loo") or parts[2] not in ("flow", "noflow"):
         raise SystemExit(f"Bad run spec '{spec}'; expected <composite|whole>:<cv10|loo>:<flow|noflow>[:seed]")
     return parts[0], parts[1], parts[2], int(parts[3]) if len(parts) == 4 else 2024
@@ -67,6 +69,18 @@ def load_run(spec):
         o = _order(d["all_true"])
         pt, pp = _pwv(d, o)
         return d["all_true"][o].reshape(-1, 32, 128), d["all_pred"][o].reshape(-1, 32, 128), pt, pp
+
+    if model == "hybrid":
+        w = np.load(results_path("whole", cv, flow, seed))
+        p = np.load(results_path("pasc", cv, flow, seed))
+        ow, op = _order(w["all_true"]), _order(p["all_true"])
+        true = w["all_true"][ow].reshape(-1, 32, 128)
+        if not np.allclose(p["all_true"][op].reshape(-1, 32, 128), true):
+            raise ValueError(f"{spec}: pasc and whole runs have different patients")
+        pred = w["all_pred"][ow].reshape(-1, 32, 128).copy()
+        pred[:, :, REGIONS["pasc"]] = p["all_pred"][op].reshape(-1, 32, 128)[:, :, REGIONS["pasc"]]
+        pt, pp = _pwv(w, ow)
+        return true, pred, pt, pp
 
     data = {r: np.load(results_path(r, cv, flow, seed)) for r in REGIONS}
     true_ref = data["pasc"]["all_true"][_order(data["pasc"]["all_true"])]
