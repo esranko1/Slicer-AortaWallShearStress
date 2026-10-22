@@ -12,6 +12,9 @@ untouched.
     --seed     repeat runs with different seeds
     --pwv-weight  weight of the pulse wave velocity loss (default 1; 0 = WSS only)
     --no-retrain  skip the retrain step below (report the epoch-selection model)
+    --align       rotate every shape onto a template built from the fold's
+                  training patients (rotation only, Procrustes using the point
+                  correspondence), so all aortas share one orientation
 
 Retrain step (default): per fold, the best epoch is first chosen on 10% of the
 training patients (validation). Then a fresh model is trained on ALL the
@@ -93,6 +96,7 @@ _ap.add_argument("--no-flow", action="store_true", help="ablation: no inlet velo
 _ap.add_argument("--seed", type=int, default=2024)
 _ap.add_argument("--pwv-weight", type=float, default=1.0, help="PWV loss weight; 0 = no PWV output")
 _ap.add_argument("--no-retrain", action="store_true", help="skip retraining on all training patients")
+_ap.add_argument("--align", action="store_true", help="rotate shapes onto a per-fold training template")
 ARGS = _ap.parse_args()
 
 if QUICK_TEST:
@@ -108,6 +112,7 @@ USE_FLOW = not ARGS.no_flow
 PWV_WEIGHT = ARGS.pwv_weight
 USE_PWV = PWV_WEIGHT > 0
 RETRAIN = not ARGS.no_retrain
+ALIGN = ARGS.align
 PWV_PATH = "../Data/Sampled/pwv_N100.npz"  # from extract_pwv.py
 
 BATCH_SIZE = 16
@@ -143,7 +148,31 @@ ROI_LONGITUDINAL_SLICE = ROI_REGIONS.get(ROI_NAME, slice(0, 128))
 RESULTS_DIR = (f"../experiments/14_Final_{ROI_NAME}_{'loo' if CV_LOO else 'cv10'}_"
                f"{'flow' if USE_FLOW else 'noflow'}" + (f"_seed{SEED}" if SEED != 2024 else "")
                + ("" if PWV_WEIGHT == 1.0 else f"_pwvw{PWV_WEIGHT:g}")
-               + ("" if RETRAIN else "_noretrain"))
+               + ("" if RETRAIN else "_noretrain")
+               + ("_aligned" if ALIGN else ""))
+
+def best_rotation(A, B):
+    """Rotation matrix R (A @ R) taking centred shape A (N, 3) onto centred shape B."""
+    u, _, vt = np.linalg.svd(A.T @ B)
+    d = np.sign(np.linalg.det(u @ vt))
+    return u @ np.diag([1, 1, d]) @ vt
+
+
+def procrustes_template(Xs, iterations=5):
+    """Generalised Procrustes mean (rotation only) of centred shapes Xs (n, N, 3)."""
+    Xc = Xs - Xs.mean(axis=1, keepdims=True)
+    mean = Xc[0]
+    for _ in range(iterations):
+        mean = np.mean([x @ best_rotation(x, mean) for x in Xc], axis=0)
+    return mean
+
+
+def align_shapes(X, template):
+    """Rotate every centred shape onto the template. Uses only each shape's own
+    geometry, so aligning test shapes leaks no labels."""
+    Xc = X - X.mean(axis=1, keepdims=True)
+    return np.stack([x @ best_rotation(x, template) for x in Xc]).astype(np.float32)
+
 
 def set_seed(seed=SEED):
     torch.manual_seed(seed)
@@ -626,7 +655,8 @@ def main():
     if N_FOLDS is None:
         N_FOLDS = X.shape[0] if CV_LOO else 10
     logging.info(f"Region {ROI_NAME}, {'leave-one-out' if CV_LOO else '10-fold'} CV ({N_FOLDS} folds), "
-                 f"{'with' if USE_FLOW else 'WITHOUT'} inlet flow input, seed {SEED} -> {RESULTS_DIR}")
+                 f"{'with' if USE_FLOW else 'WITHOUT'} inlet flow input, seed {SEED}"
+                 f"{', shapes aligned per fold' if ALIGN else ''} -> {RESULTS_DIR}")
     kf = KFold(n_splits=N_FOLDS, shuffle=True, random_state=SEED)
 
     all_true, all_pred = [], []
@@ -653,6 +683,10 @@ def main():
         else:
             logging.info(f"\n=== Fold {fold_idx} ===")
             # Validation patients come out of this fold's training patients only
+            # Optional: rotate all shapes onto a template from this fold's
+            # training patients only (no test shape or label is used to build it)
+            Xf = align_shapes(X, procrustes_template(X[train_ix])) if ALIGN else X
+
             rng = np.random.default_rng(SEED + fold_idx)
             n_val = max(1, int(round(VAL_FRACTION * len(train_ix))))
             val_ix = rng.choice(train_ix, n_val, replace=False)
@@ -675,9 +709,9 @@ def main():
                 p_scale = lambda v: (v - p_min) / (p_max - p_min)  # noqa: E731
 
             pred_scaled, pwv_scaled, best_val_loss, best_state, best_epoch = train_one_fold(
-                X[fit_ix], scale(Y[fit_ix]), z_scale(Z[fit_ix]),
-                X[val_ix], scale(Y[val_ix]), z_scale(Z[val_ix]),
-                X[test_ix], z_scale(Z[test_ix]),
+                Xf[fit_ix], scale(Y[fit_ix]), z_scale(Z[fit_ix]),
+                Xf[val_ix], scale(Y[val_ix]), z_scale(Z[val_ix]),
+                Xf[test_ix], z_scale(Z[test_ix]),
                 device, fold_idx, input_channels=input_channels,
                 P_train=p_scale(PWV[fit_ix]) if USE_PWV else None,
                 P_val=p_scale(PWV[val_ix]) if USE_PWV else None,
@@ -694,9 +728,9 @@ def main():
                 if USE_PWV:
                     p_min, p_max = PWV[train_ix].min(), PWV[train_ix].max()
                 pred_scaled, pwv_scaled, best_state = retrain_fixed_epochs(
-                    X[train_ix], scale(Y[train_ix]), z_scale(Z[train_ix]),
+                    Xf[train_ix], scale(Y[train_ix]), z_scale(Z[train_ix]),
                     p_scale(PWV[train_ix]) if USE_PWV else None,
-                    n_epochs, X[test_ix], z_scale(Z[test_ix]), device, fold_idx, input_channels=input_channels)
+                    n_epochs, Xf[test_ix], z_scale(Z[test_ix]), device, fold_idx, input_channels=input_channels)
             pred = pred_scaled * (y_max - y_min) + y_min
             true = Y[test_ix]
             pwv_pred = pwv_scaled * (p_max - p_min) + p_min if USE_PWV else None

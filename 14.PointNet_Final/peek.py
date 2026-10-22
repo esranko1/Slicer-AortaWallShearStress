@@ -26,10 +26,13 @@ def main():
     ap.add_argument("region", choices=["pasc", "arch", "desc", "abda", "whole"])
     ap.add_argument("--cv", choices=["10", "loo"], default="10")
     ap.add_argument("--no-flow", action="store_true")
+    ap.add_argument("--seed", type=int, default=2024)
+    ap.add_argument("--aligned", action="store_true")
     args = ap.parse_args()
 
     folder = (f"../experiments/14_Final_{args.region}_{'loo' if args.cv == 'loo' else 'cv10'}_"
-              f"{'noflow' if args.no_flow else 'flow'}")
+              f"{'noflow' if args.no_flow else 'flow'}" + (f"_seed{args.seed}" if args.seed != 2024 else "")
+              + ("_aligned" if args.aligned else ""))
     files = sorted(glob.glob(os.path.join(folder, "fold*_of*_results.npz")),
                    key=lambda f: int(re.search(r"fold(\d+)_", f).group(1)))
     if not files:

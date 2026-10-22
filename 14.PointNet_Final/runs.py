@@ -2,7 +2,7 @@
 Shared helpers for stitch.py and compare_runs.py: load a run's held-out
 predictions, build the four-region composite, and score both Pearson metrics.
 
-A run is named by a spec string  "<model>:<cv>:<flow>[:seed]"
+A run is named by a spec string  "<model>:<cv>:<flow>[:seed][:aligned]"
     model  composite (the four specialists stitched) | whole (single model)
            | hybrid (the pasc specialist on the proximal ascending aorta, the
              whole-vessel model everywhere else; PWV from the whole model)
@@ -10,7 +10,8 @@ A run is named by a spec string  "<model>:<cv>:<flow>[:seed]"
     cv     cv10 | loo
     flow   flow | noflow
     seed   optional, default 2024
-e.g. "composite:loo:flow", "whole:cv10:noflow", "composite:cv10:flow:7".
+e.g. "composite:loo:flow", "whole:cv10:noflow", "composite:cv10:flow:7",
+"whole:cv10:flow:aligned" (main.py --align).
 
 Patients are put in one canonical order (sorted by their true WSS), so runs
 with different CV schemes - whose pooled arrays come out in different patient
@@ -31,19 +32,21 @@ WHOLE = slice(0, 128)
 BASELINES = ("meanmap", "poiseuille", "flowradius")
 
 
-def results_path(region, cv, flow, seed):
+def results_path(region, cv, flow, seed, aligned=False):
     if region in BASELINES:
         return f"../experiments/15_Baselines_{cv}/{region}/results.npz"
-    suffix = f"_seed{seed}" if seed != 2024 else ""
+    suffix = (f"_seed{seed}" if seed != 2024 else "") + ("_aligned" if aligned else "")
     return f"../experiments/14_Final_{region}_{cv}_{flow}{suffix}/results.npz"
 
 
 def parse_spec(spec):
     parts = spec.split(":")
+    aligned = "aligned" in parts[3:]
+    parts = [p for i, p in enumerate(parts) if not (i >= 3 and p == "aligned")]
     if len(parts) not in (3, 4) or parts[0] not in ("composite", "whole", "hybrid") + BASELINES \
             or parts[1] not in ("cv10", "loo") or parts[2] not in ("flow", "noflow"):
         raise SystemExit(f"Bad run spec '{spec}'; expected <composite|whole>:<cv10|loo>:<flow|noflow>[:seed]")
-    return parts[0], parts[1], parts[2], int(parts[3]) if len(parts) == 4 else 2024
+    return parts[0], parts[1], parts[2], int(parts[3]) if len(parts) == 4 else 2024, aligned
 
 
 def _order(true):
@@ -63,16 +66,16 @@ def load_run(spec):
     in canonical patient order. PWV is None if the run had no PWV output; for the
     composite it is the mean of the four specialists' PWV predictions.
     """
-    model, cv, flow, seed = parse_spec(spec)
+    model, cv, flow, seed, aligned = parse_spec(spec)
     if model == "whole" or model in BASELINES:
-        d = np.load(results_path(model, cv, flow, seed))
+        d = np.load(results_path(model, cv, flow, seed, aligned))
         o = _order(d["all_true"])
         pt, pp = _pwv(d, o)
         return d["all_true"][o].reshape(-1, 32, 128), d["all_pred"][o].reshape(-1, 32, 128), pt, pp
 
     if model == "hybrid":
-        w = np.load(results_path("whole", cv, flow, seed))
-        p = np.load(results_path("pasc", cv, flow, seed))
+        w = np.load(results_path("whole", cv, flow, seed, aligned))
+        p = np.load(results_path("pasc", cv, flow, seed, aligned))
         ow, op = _order(w["all_true"]), _order(p["all_true"])
         true = w["all_true"][ow].reshape(-1, 32, 128)
         if not np.allclose(p["all_true"][op].reshape(-1, 32, 128), true):
@@ -82,7 +85,7 @@ def load_run(spec):
         pt, pp = _pwv(w, ow)
         return true, pred, pt, pp
 
-    data = {r: np.load(results_path(r, cv, flow, seed)) for r in REGIONS}
+    data = {r: np.load(results_path(r, cv, flow, seed, aligned)) for r in REGIONS}
     true_ref = data["pasc"]["all_true"][_order(data["pasc"]["all_true"])]
     pred = np.zeros((true_ref.shape[0], 32, 128))
     pwv_true, pwv_preds = None, []

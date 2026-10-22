@@ -87,7 +87,54 @@ def procrustes_angles(X):
         for j in range(i + 1, n):
             pair[i, j] = pair[j, i] = rotation_between(Xc[i], Xc[j])
     medoid = int(np.argmin(np.median(pair, axis=1)))
-    return pair[medoid]
+    return pair[medoid], medoid
+
+
+def best_rotation(A, B):
+    """Rotation matrix R (rows act on points: A @ R) taking centred shape A onto B."""
+    u, _, vt = np.linalg.svd(A.T @ B)
+    d = np.sign(np.linalg.det(u @ vt))
+    return u @ np.diag([1, 1, d]) @ vt
+
+
+def geometric_ring_check(X, medoid):
+    """
+    Does ring point 0 sit at the same anatomical spot in every patient? Uses
+    geometry only (no WSS). Each shape is rotated onto the medoid shape; then,
+    for every ring, the direction from the ring centre to point 0 is projected
+    into the medoid's ring plane and its angle to the medoid's point-0
+    direction is measured. Also checks the winding direction (point 0 -> 1
+    clockwise or anticlockwise about the vessel), which flips if a patient's
+    rings are numbered the other way round.
+    returns angle (n, 128) in degrees (-180..180) and reversed (n,) bool
+    """
+    n = len(X)
+    G = (X - X.mean(axis=1, keepdims=True)).reshape(n, N_CIRC, N_AXIAL, 3)
+    ref = G[medoid]
+    ref_c = ref.mean(axis=0)                                        # (128, 3)
+    tang = np.gradient(ref_c, axis=0)
+    tang /= np.linalg.norm(tang, axis=1, keepdims=True)
+    u_ref = ref[0] - ref_c
+    u_ref -= (u_ref * tang).sum(axis=1, keepdims=True) * tang
+    u_ref /= np.linalg.norm(u_ref, axis=1, keepdims=True)
+    v_ref = np.cross(tang, u_ref)
+
+    angle = np.zeros((n, N_AXIAL))
+    winding = np.zeros(n)
+    for i in range(n):
+        # winding on the patient's own geometry: is point 1 anticlockwise from
+        # point 0 about the patient's own centerline direction?
+        own_c = G[i].mean(axis=0)
+        own_t = np.gradient(own_c, axis=0)
+        winding[i] = np.sign(np.mean(np.sign((np.cross(G[i][0] - own_c, G[i][1] - own_c) * own_t).sum(axis=1))))
+        R = best_rotation(G[i].reshape(-1, 3), ref.reshape(-1, 3))
+        g = (G[i].reshape(-1, 3) @ R).reshape(N_CIRC, N_AXIAL, 3)
+        c = g.mean(axis=0)
+        p0 = g[0] - c
+        angle[i] = np.degrees(np.arctan2((p0 * v_ref).sum(axis=1), (p0 * u_ref).sum(axis=1)))
+    majority = np.sign(winding.sum()) or 1.0
+    reversed_ = winding != majority
+    return angle, reversed_
 
 
 def tortuosity(X):
@@ -125,7 +172,7 @@ def main():
     n = len(X)
     Yg = Y.reshape(n, N_CIRC, N_AXIAL)
 
-    angles = procrustes_angles(X)
+    angles, medoid = procrustes_angles(X)
     tort = tortuosity(X)
     print(f"{n} patients\n")
     print("3D orientation (rotation to the most typical patient):")
@@ -141,7 +188,21 @@ def main():
     for name, col in REGIONS.items():
         spatial[name][order] = r_spatial_per_patient(true, pred, col)
 
-    rows = {"patient": np.arange(n), "rotation_deg": angles, "tortuosity": tort}
+    geo_angle, reversed_ = geometric_ring_check(X, medoid)
+    rows = {"patient": np.arange(n), "rotation_deg": angles, "tortuosity": tort,
+            "ring_numbering_reversed": reversed_.astype(int)}
+    for name, col in REGIONS.items():
+        rows[f"{name}_point0_angle_deg"] = np.abs(geo_angle[:, col]).mean(axis=1)
+    print("\nGrid alignment from geometry (direction of ring point 0, after rotating shapes onto the typical one):")
+    print(f"  ring numbering reversed (other winding direction): {reversed_.sum()} patients")
+    print(f"{'region':6s} {'median |angle|':>15s} {'within 11 deg':>14s} {'beyond 45 deg':>14s}")
+    for name, col in REGIONS.items():
+        a = np.abs(geo_angle[:, col]).mean(axis=1)
+        print(f"{name:6s} {np.median(a):11.1f} deg {np.mean(a <= DEG_PER_SHIFT) * 100:13.0f}% "
+              f"{np.mean(a > 45) * 100:13.0f}%")
+    print("(If point 0 sits at the same anatomical spot, these angles are small. Large angles here mean the "
+          "grid really is misaligned; small ones mean the WSS-based shifts below are mostly noise from flat maps.)")
+
     print("\nRing alignment (best shift of each patient's WSS onto the others' average map):")
     print(f"{'region':6s} {'median |shift|':>15s} {'within +-1 step':>16s} {'|shift| >= 4 (45 deg)':>22s}")
     shifts_by_region = {}

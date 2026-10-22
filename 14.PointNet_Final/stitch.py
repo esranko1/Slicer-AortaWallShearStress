@@ -2,7 +2,7 @@
 Results table for one setting: the four-region composite (and the whole-vessel
 baseline, if that run exists), with both Pearson metrics per region.
 
-    python stitch.py [--cv 10|loo] [--no-flow] [--seed N]
+    python stitch.py [--cv 10|loo] [--no-flow] [--seed N] [--aligned]
 
 Metrics:
   level r    correlation across patients of each patient's median WSS (what
@@ -41,13 +41,14 @@ def main():
     ap.add_argument("--cv", choices=["10", "loo"], default="10")
     ap.add_argument("--no-flow", action="store_true")
     ap.add_argument("--seed", type=int, default=2024)
+    ap.add_argument("--aligned", action="store_true", help="the runs made with main.py --align")
     args = ap.parse_args()
     flow = "noflow" if args.no_flow else "flow"
     args.cv = "cv10" if args.cv == "10" else "loo"
-    tail = f"{args.cv}:{flow}:{args.seed}"
+    tail = f"{args.cv}:{flow}:{args.seed}" + (":aligned" if args.aligned else "")
 
     specs = [f"composite:{tail}"]
-    if os.path.exists(results_path("whole", args.cv, flow, args.seed)):
+    if os.path.exists(results_path("whole", args.cv, flow, args.seed, args.aligned)):
         specs.append(f"whole:{tail}")
 
     for spec in specs:
