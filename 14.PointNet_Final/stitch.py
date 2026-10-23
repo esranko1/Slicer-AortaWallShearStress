@@ -42,13 +42,15 @@ def main():
     ap.add_argument("--no-flow", action="store_true")
     ap.add_argument("--seed", type=int, default=2024)
     ap.add_argument("--aligned", action="store_true", help="the runs made with main.py --align")
+    ap.add_argument("--physics", choices=["none", "input", "ratio"], default="none")
     args = ap.parse_args()
     flow = "noflow" if args.no_flow else "flow"
     args.cv = "cv10" if args.cv == "10" else "loo"
-    tail = f"{args.cv}:{flow}:{args.seed}" + (":aligned" if args.aligned else "")
+    tags = (["aligned"] if args.aligned else []) + ([f"phys-{args.physics}"] if args.physics != "none" else [])
+    tail = f"{args.cv}:{flow}:{args.seed}" + "".join(f":{t}" for t in tags)
 
     specs = [f"composite:{tail}"]
-    if os.path.exists(results_path("whole", args.cv, flow, args.seed, args.aligned)):
+    if os.path.exists(results_path("whole", args.cv, flow, args.seed, tags)):
         specs.append(f"whole:{tail}")
 
     for spec in specs:

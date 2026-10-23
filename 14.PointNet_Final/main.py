@@ -12,6 +12,15 @@ untouched.
     --seed     repeat runs with different seeds
     --pwv-weight  weight of the pulse wave velocity loss (default 1; 0 = WSS only)
     --no-retrain  skip the retrain step below (report the epoch-selection model)
+    --physics input|ratio
+                  add Poiseuille physics. Per ring, tau = 4 mu Q / (pi r^3) with
+                  r the ring radius and Q = peak inlet velocity x inlet area
+                  (--z-is-flow if the inlet curve is already a flow rate).
+                  input: log(tau), standardised on the fold's training patients,
+                         is an extra input channel at every point.
+                  ratio: the network predicts WSS / tau (the geometry
+                         correction to Poiseuille) and the result is
+                         multiplied back by tau.
     --align       rotate every shape onto a template built from the fold's
                   training patients (rotation only, Procrustes using the point
                   correspondence), so all aortas share one orientation
@@ -97,6 +106,9 @@ _ap.add_argument("--seed", type=int, default=2024)
 _ap.add_argument("--pwv-weight", type=float, default=1.0, help="PWV loss weight; 0 = no PWV output")
 _ap.add_argument("--no-retrain", action="store_true", help="skip retraining on all training patients")
 _ap.add_argument("--align", action="store_true", help="rotate shapes onto a per-fold training template")
+_ap.add_argument("--physics", choices=["none", "input", "ratio"], default="none",
+                 help="Poiseuille as an extra input, or predict WSS / Poiseuille")
+_ap.add_argument("--z-is-flow", action="store_true", help="the inlet curve is a flow rate, not a velocity")
 ARGS = _ap.parse_args()
 
 if QUICK_TEST:
@@ -113,6 +125,7 @@ PWV_WEIGHT = ARGS.pwv_weight
 USE_PWV = PWV_WEIGHT > 0
 RETRAIN = not ARGS.no_retrain
 ALIGN = ARGS.align
+PHYSICS = ARGS.physics
 PWV_PATH = "../Data/Sampled/pwv_N100.npz"  # from extract_pwv.py
 
 BATCH_SIZE = 16
@@ -149,7 +162,9 @@ RESULTS_DIR = (f"../experiments/14_Final_{ROI_NAME}_{'loo' if CV_LOO else 'cv10'
                f"{'flow' if USE_FLOW else 'noflow'}" + (f"_seed{SEED}" if SEED != 2024 else "")
                + ("" if PWV_WEIGHT == 1.0 else f"_pwvw{PWV_WEIGHT:g}")
                + ("" if RETRAIN else "_noretrain")
-               + ("_aligned" if ALIGN else ""))
+               + ("_aligned" if ALIGN else "")
+               + ("" if PHYSICS == "none" else f"_phys-{PHYSICS}")
+               + ("_zflow" if ARGS.z_is_flow and PHYSICS != "none" else ""))
 
 def best_rotation(A, B):
     """Rotation matrix R (A @ R) taking centred shape A (N, 3) onto centred shape B."""
@@ -172,6 +187,23 @@ def align_shapes(X, template):
     geometry, so aligning test shapes leaks no labels."""
     Xc = X - X.mean(axis=1, keepdims=True)
     return np.stack([x @ best_rotation(x, template) for x in Xc]).astype(np.float32)
+
+
+def poiseuille_tau(X, Z, z_is_flow=False):
+    """
+    Poiseuille WSS per point, tau = 4 mu Q / (pi r^3) with mu = 1: (n, 4096).
+    r = mean distance of each ring's 32 points to the ring centre (rotation-
+    invariant); Q = peak inlet velocity x first-ring area, or the peak of the
+    curve itself if it is already a flow rate. Points are circumferential-major
+    (index = c * 128 + a). Uses shape and inlet flow only, no labels.
+    """
+    n = X.shape[0]
+    grid = X.reshape(n, 32, 128, 3).astype(np.float64)
+    r = np.linalg.norm(grid - grid.mean(axis=1, keepdims=True), axis=3).mean(axis=1)   # (n, 128)
+    peak = np.abs(Z).max(axis=1)
+    Q = peak if z_is_flow else peak * np.pi * r[:, 0] ** 2
+    tau = 4.0 * Q[:, None] / (np.pi * r ** 3)                                          # (n, 128)
+    return np.repeat(tau[:, None, :], 32, axis=1).reshape(n, -1)
 
 
 def set_seed(seed=SEED):
@@ -636,7 +668,15 @@ def main():
         geo_feats = geo[:, :, 3:7].astype(np.float32)  # [nx, ny, nz, dist]
         X = np.concatenate([X, geo_feats], axis=2)  # (100, 4096, 7)
         logging.info(f"Using geometric features from {GEOMETRIC_FEATURES_PATH}")
-    input_channels = X.shape[-1]
+    input_channels = X.shape[-1] + (1 if PHYSICS == "input" else 0)
+
+    # Poiseuille per point (shape + inlet flow only). For "ratio" the training
+    # target becomes WSS / tau; predictions are multiplied back by tau.
+    TAU = poiseuille_tau(X, Z, ARGS.z_is_flow) if PHYSICS != "none" else None
+    T = (Y / TAU).astype(np.float32) if PHYSICS == "ratio" else Y
+    if PHYSICS != "none":
+        logging.info(f"Physics: {PHYSICS} (Poiseuille tau range {TAU.min():.3g}-{TAU.max():.3g}, "
+                     f"Q from peak inlet {'flow' if ARGS.z_is_flow else 'velocity x inlet area'})")
 
     PWV = None
     if USE_PWV:
@@ -656,7 +696,8 @@ def main():
         N_FOLDS = X.shape[0] if CV_LOO else 10
     logging.info(f"Region {ROI_NAME}, {'leave-one-out' if CV_LOO else '10-fold'} CV ({N_FOLDS} folds), "
                  f"{'with' if USE_FLOW else 'WITHOUT'} inlet flow input, seed {SEED}"
-                 f"{', shapes aligned per fold' if ALIGN else ''} -> {RESULTS_DIR}")
+                 f"{', shapes aligned per fold' if ALIGN else ''}"
+                 f"{', physics ' + PHYSICS if PHYSICS != 'none' else ''} -> {RESULTS_DIR}")
     kf = KFold(n_splits=N_FOLDS, shuffle=True, random_state=SEED)
 
     all_true, all_pred = [], []
@@ -686,6 +727,11 @@ def main():
             # Optional: rotate all shapes onto a template from this fold's
             # training patients only (no test shape or label is used to build it)
             Xf = align_shapes(X, procrustes_template(X[train_ix])) if ALIGN else X
+            if PHYSICS == "input":
+                # log(tau) as an extra channel, standardised on the training patients
+                lt = np.log(TAU)
+                mu_t, sd_t = lt[train_ix].mean(), lt[train_ix].std() + 1e-8
+                Xf = np.concatenate([Xf, ((lt - mu_t) / sd_t)[:, :, None]], axis=2).astype(np.float32)
 
             rng = np.random.default_rng(SEED + fold_idx)
             n_val = max(1, int(round(VAL_FRACTION * len(train_ix))))
@@ -694,7 +740,7 @@ def main():
             logging.info(f"  {len(fit_ix)} train / {len(val_ix)} validation (epoch selection) / {len(test_ix)} test patients")
 
             # Scale Y to [0, 1] with the training patients' range only
-            y_min, y_max = Y[fit_ix].min(), Y[fit_ix].max()
+            y_min, y_max = T[fit_ix].min(), T[fit_ix].max()
             scale = lambda v: (v - y_min) / (y_max - y_min)  # noqa: E731
 
             # Inlet flow waveform scaled by its largest magnitude among the training
@@ -709,8 +755,8 @@ def main():
                 p_scale = lambda v: (v - p_min) / (p_max - p_min)  # noqa: E731
 
             pred_scaled, pwv_scaled, best_val_loss, best_state, best_epoch = train_one_fold(
-                Xf[fit_ix], scale(Y[fit_ix]), z_scale(Z[fit_ix]),
-                Xf[val_ix], scale(Y[val_ix]), z_scale(Z[val_ix]),
+                Xf[fit_ix], scale(T[fit_ix]), z_scale(Z[fit_ix]),
+                Xf[val_ix], scale(T[val_ix]), z_scale(Z[val_ix]),
                 Xf[test_ix], z_scale(Z[test_ix]),
                 device, fold_idx, input_channels=input_channels,
                 P_train=p_scale(PWV[fit_ix]) if USE_PWV else None,
@@ -723,15 +769,17 @@ def main():
                 logging.info(f"  Best epoch {best_epoch} on validation -> retraining on all "
                              f"{len(train_ix)} training patients for {n_epochs} epochs")
                 # scale / p_scale read y_min.. at call time, so they now use this range
-                y_min, y_max = Y[train_ix].min(), Y[train_ix].max()
+                y_min, y_max = T[train_ix].min(), T[train_ix].max()
                 z_max = float(np.abs(Z[train_ix]).max()) or 1.0
                 if USE_PWV:
                     p_min, p_max = PWV[train_ix].min(), PWV[train_ix].max()
                 pred_scaled, pwv_scaled, best_state = retrain_fixed_epochs(
-                    Xf[train_ix], scale(Y[train_ix]), z_scale(Z[train_ix]),
+                    Xf[train_ix], scale(T[train_ix]), z_scale(Z[train_ix]),
                     p_scale(PWV[train_ix]) if USE_PWV else None,
                     n_epochs, Xf[test_ix], z_scale(Z[test_ix]), device, fold_idx, input_channels=input_channels)
             pred = pred_scaled * (y_max - y_min) + y_min
+            if PHYSICS == "ratio":
+                pred = pred * TAU[test_ix]          # back from WSS / tau to WSS
             true = Y[test_ix]
             pwv_pred = pwv_scaled * (p_max - p_min) + p_min if USE_PWV else None
             pwv_true = PWV[test_ix] if USE_PWV else None
