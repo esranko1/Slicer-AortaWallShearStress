@@ -21,6 +21,11 @@ untouched.
                   ratio: the network predicts WSS / tau (the geometry
                          correction to Poiseuille) and the result is
                          multiplied back by tau.
+    --arch pointnet|cnn
+                  pointnet (default): the region-specialist PointNet below.
+                  cnn: a small 2D U-Net on the unwrapped 32 x 128 wall map
+                  (around x along the vessel), with convolutions that wrap
+                  around the ring; same inputs, outputs and protocol.
     --align       rotate every shape onto a template built from the fold's
                   training patients (rotation only, Procrustes using the point
                   correspondence), so all aortas share one orientation
@@ -106,6 +111,7 @@ _ap.add_argument("--seed", type=int, default=2024)
 _ap.add_argument("--pwv-weight", type=float, default=1.0, help="PWV loss weight; 0 = no PWV output")
 _ap.add_argument("--no-retrain", action="store_true", help="skip retraining on all training patients")
 _ap.add_argument("--align", action="store_true", help="rotate shapes onto a per-fold training template")
+_ap.add_argument("--arch", choices=["pointnet", "cnn"], default="pointnet", help="network type")
 _ap.add_argument("--physics", choices=["none", "input", "ratio"], default="none",
                  help="Poiseuille as an extra input, or predict WSS / Poiseuille")
 _ap.add_argument("--z-is-flow", action="store_true", help="the inlet curve is a flow rate, not a velocity")
@@ -126,6 +132,7 @@ USE_PWV = PWV_WEIGHT > 0
 RETRAIN = not ARGS.no_retrain
 ALIGN = ARGS.align
 PHYSICS = ARGS.physics
+ARCH = ARGS.arch
 PWV_PATH = "../Data/Sampled/pwv_N100.npz"  # from extract_pwv.py
 
 BATCH_SIZE = 16
@@ -164,7 +171,8 @@ RESULTS_DIR = (f"../experiments/14_Final_{ROI_NAME}_{'loo' if CV_LOO else 'cv10'
                + ("" if RETRAIN else "_noretrain")
                + ("_aligned" if ALIGN else "")
                + ("" if PHYSICS == "none" else f"_phys-{PHYSICS}")
-               + ("_zflow" if ARGS.z_is_flow and PHYSICS != "none" else ""))
+               + ("_zflow" if ARGS.z_is_flow and PHYSICS != "none" else "")
+               + ("_cnn" if ARCH == "cnn" else ""))
 
 def best_rotation(A, B):
     """Rotation matrix R (A @ R) taking centred shape A (N, 3) onto centred shape B."""
@@ -369,6 +377,93 @@ class AortaPointNetVelocity(nn.Module):
 # learned alignment matrices, matching the PI's SSIMLoss + OrthogonalRegularizer.
 # ---------------------------------------------------------------------------
 
+class RingConv(nn.Module):
+    """3x3 conv on the (around, along) wall map: wraps around the ring (dim H),
+    replicates at the two vessel ends (dim W). + GroupNorm + SiLU."""
+    def __init__(self, cin, cout, groups=8):
+        super().__init__()
+        self.conv = nn.Conv2d(cin, cout, kernel_size=3, padding=0)
+        self.norm = nn.GroupNorm(groups, cout)
+        self.act = nn.SiLU()
+
+    def forward(self, x):
+        x = F.pad(x, (0, 0, 1, 1), mode="circular")
+        x = F.pad(x, (1, 1, 0, 0), mode="replicate")
+        return self.act(self.norm(self.conv(x)))
+
+
+class RingBlock(nn.Module):
+    def __init__(self, cin, cout):
+        super().__init__()
+        self.a, self.b = RingConv(cin, cout), RingConv(cout, cout)
+
+    def forward(self, x):
+        return self.b(self.a(x))
+
+
+class WallMapUNet(nn.Module):
+    """
+    2D U-Net on the unwrapped wall: point index c * 128 + a -> pixel (c, a) of a
+    32 (around) x 128 (along) map, input channels = per-point features
+    (x, y, z [, Poiseuille]). Encoder 32-64-128-256 channels (map 32x128 ->
+    4x16), the inlet-flow embedding is concatenated at the bottleneck, decoder
+    with skip connections back to one WSS value per pixel. PWV comes from the
+    pooled bottleneck. Same call signature and outputs as AortaPointNetVelocity
+    (the two alignment matrices are identities, so their regulariser is 0).
+    """
+    COORD_SCALE = 100.0   # coordinates are in the hundreds; bring them to O(1)
+
+    def __init__(self, velocity_dim=VELOCITY_DIM, input_channels=3, use_flow=True, use_pwv=True, width=32):
+        super().__init__()
+        self.use_flow, self.use_pwv = use_flow, use_pwv
+        c1, c2, c3, c4 = width, 2 * width, 4 * width, 8 * width
+        self.enc1, self.enc2 = RingBlock(input_channels, c1), RingBlock(c1, c2)
+        self.enc3, self.enc4 = RingBlock(c2, c3), RingBlock(c3, c4)
+        self.pool = nn.AvgPool2d(2)
+        flow_dim = 128 if use_flow else 0
+        if use_flow:
+            self.velocity_encoder = nn.Sequential(nn.Linear(velocity_dim, 64), nn.SiLU(),
+                                                  nn.Linear(64, 128), nn.SiLU())
+        self.bottleneck = RingBlock(c4 + flow_dim, c4)
+        self.dec3, self.dec2, self.dec1 = RingBlock(c4 + c3, c3), RingBlock(c3 + c2, c2), RingBlock(c2 + c1, c1)
+        self.head = nn.Conv2d(c1, 1, kernel_size=1)
+        self.pred_act = nn.SiLU()
+        if use_pwv:
+            self.pwv_head = nn.Sequential(nn.Linear(c4 + flow_dim, 128), nn.SiLU(), nn.Linear(128, 1))
+
+    @staticmethod
+    def up(x, like):
+        return F.interpolate(x, size=like.shape[-2:], mode="nearest")
+
+    def forward(self, points, velocity):
+        b = points.shape[0]
+        x = points.transpose(1, 2).reshape(b, -1, 32, 128)        # (b, C, around, along)
+        x = torch.cat([x[:, :3] / self.COORD_SCALE, x[:, 3:]], dim=1)
+        e1 = self.enc1(x)                                         # 32 x 128
+        e2 = self.enc2(self.pool(e1))                             # 16 x 64
+        e3 = self.enc3(self.pool(e2))                             # 8 x 32
+        e4 = self.enc4(self.pool(e3))                             # 4 x 16
+        if self.use_flow:
+            v = self.velocity_encoder(velocity)[:, :, None, None].expand(-1, -1, *e4.shape[-2:])
+            e4 = torch.cat([e4, v], dim=1)
+        z = self.bottleneck(e4)
+        g = e4.mean(dim=(2, 3))                                   # pooled bottleneck input (+ flow)
+        d3 = self.dec3(torch.cat([self.up(z, e3), e3], dim=1))
+        d2 = self.dec2(torch.cat([self.up(d3, e2), e2], dim=1))
+        d1 = self.dec1(torch.cat([self.up(d2, e1), e1], dim=1))
+        out = self.pred_act(self.head(d1)).reshape(b, -1)        # back to point order c * 128 + a
+        pwv = self.pwv_head(g).squeeze(-1) if self.use_pwv else None
+        eye3 = torch.eye(3, device=out.device).expand(b, 3, 3)
+        eye128 = torch.eye(128, device=out.device).expand(b, 128, 128)
+        return out, eye3, eye128, pwv
+
+
+def build_model(input_channels):
+    if ARCH == "cnn":
+        return WallMapUNet(input_channels=input_channels, use_flow=USE_FLOW, use_pwv=USE_PWV)
+    return AortaPointNetVelocity(input_channels=input_channels, use_flow=USE_FLOW, use_pwv=USE_PWV)
+
+
 def compute_ssim(pred, target, data_range=1.0, window_size=3):
     """Lightweight single-scale SSIM (average-pooling window). pred/target: (batch, 1, H, W)."""
     C1 = (0.01 * data_range) ** 2
@@ -475,7 +570,7 @@ def pwv_loss(pwv_pred, pwv_true):
 
 def train_one_fold(X_train, Y_train, Z_train, X_val, Y_val, Z_val, X_test, Z_test, device, fold_idx,
                    input_channels=3, P_train=None, P_val=None):
-    model = AortaPointNetVelocity(input_channels=input_channels, use_flow=USE_FLOW, use_pwv=USE_PWV).to(device)
+    model = build_model(input_channels).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-5)
     roi_slice = ROI_LONGITUDINAL_SLICE if USE_ROI_LOSS else None
 
@@ -604,7 +699,7 @@ def retrain_fixed_epochs(X_all, Y_all, Z_all, P_all, n_epochs, X_test, Z_test, d
     already decided, so the test patients play no part in it.
     """
     torch.manual_seed(SEED + 1000 + fold_idx)
-    model = AortaPointNetVelocity(input_channels=input_channels, use_flow=USE_FLOW, use_pwv=USE_PWV).to(device)
+    model = build_model(input_channels).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-5)
     roi_slice = ROI_LONGITUDINAL_SLICE if USE_ROI_LOSS else None
     to = lambda a: torch.tensor(a, dtype=torch.float32, device=device)  # noqa: E731
@@ -697,7 +792,8 @@ def main():
     logging.info(f"Region {ROI_NAME}, {'leave-one-out' if CV_LOO else '10-fold'} CV ({N_FOLDS} folds), "
                  f"{'with' if USE_FLOW else 'WITHOUT'} inlet flow input, seed {SEED}"
                  f"{', shapes aligned per fold' if ALIGN else ''}"
-                 f"{', physics ' + PHYSICS if PHYSICS != 'none' else ''} -> {RESULTS_DIR}")
+                 f"{', physics ' + PHYSICS if PHYSICS != 'none' else ''}"
+                 f"{', 2D CNN on the wall map' if ARCH == 'cnn' else ''} -> {RESULTS_DIR}")
     kf = KFold(n_splits=N_FOLDS, shuffle=True, random_state=SEED)
 
     all_true, all_pred = [], []
