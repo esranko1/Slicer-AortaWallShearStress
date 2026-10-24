@@ -9,6 +9,7 @@ tags (any order): aligned (main.py --align), phys-input / phys-ratio
            | hybrid (the pasc specialist on the proximal ascending aorta, the
              whole-vessel model everywhere else; PWV from the whole model)
            | meanmap | poiseuille | flowradius (baselines.py; cv10 only, flow ignored)
+           | shapemodes | shapemodes-noflow (shape_modes.py; cv10 only, flow ignored)
     cv     cv10 | loo
     flow   flow | noflow
     seed   optional, default 2024
@@ -31,7 +32,7 @@ REGIONS = {
 WHOLE = slice(0, 128)
 
 
-BASELINES = ("meanmap", "poiseuille", "flowradius")
+BASELINES = ("meanmap", "poiseuille", "flowradius", "shapemodes", "shapemodes-noflow")
 
 
 TAGS = ("aligned", "phys-input", "phys-ratio", "zflow", "cnn")
