@@ -203,6 +203,22 @@ def main():
         good = np.arange(len(row_ix))
     scale = np.median(ring_radius(xyz_a)[col_ix].mean(axis=1) / ring_radius(xyz_t)[row_ix].mean(axis=1))
     print(f"Size check: 4D-flow radius / training radius, median {scale:.3f} (1.0 = same units).")
+
+    # Per cohort: if the size or inlet ratio is constant within a cohort but differs between
+    # cohorts, the training data has a cohort-dependent unit (e.g. voxels of different sizes).
+    groups = np.array([cohort(ids[j]) for j in col_ix])
+    r_t, r_a = ring_radius(xyz_t)[row_ix].mean(axis=1), ring_radius(xyz_a)[col_ix].mean(axis=1)
+    inlet_ratio = np.abs(Z_t[row_ix]).max(axis=1) / np.abs(v_a[col_ix]).max(axis=1)
+    q = lambda v: f"{np.median(v):7.3g} [{np.percentile(v, 25):.3g}-{np.percentile(v, 75):.3g}]"  # noqa: E731
+    print(f"\nPer cohort, median [IQR]:\n{'cohort':7s} {'n':>3s} {'radius, training':>22s} "
+          f"{'radius, 4D-flow (mm)':>22s} {'size ratio':>22s} {'Zreal / inlet v':>22s}")
+    for g in ("MC", "other"):
+        m = groups == g
+        if m.any():
+            print(f"{g:7s} {m.sum():3d} {q(r_t[m]):>22s} {q(r_a[m]):>22s} {q(r_a[m] / r_t[m]):>22s} "
+                  f"{q(inlet_ratio[m]):>22s}")
+    print("Aortic radius is ~10-15 mm. A size ratio that is tight within each cohort but differs between them "
+          "means the training coordinates are in a per-cohort unit (e.g. voxels), not mm.")
     shape_r, units = inlet_units(Z_t[row_ix[good]], v_a[col_ix[good]], xyz_t[row_ix[good]])
     print(f"\nInlet curve: Zreal vs measured mean inlet velocity, waveform shape r median {np.median(shape_r):.3f} "
           f"(over {len(good)} well-matched pairs).")
