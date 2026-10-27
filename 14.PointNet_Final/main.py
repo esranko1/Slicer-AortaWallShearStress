@@ -29,6 +29,12 @@ untouched.
     --align       rotate every shape onto a template built from the fold's
                   training patients (rotation only, Procrustes using the point
                   correspondence), so all aortas share one orientation
+    --planes W    extra training targets: the measured 4D-flow velocity on the
+                  36 planes (plane_targets.npz, from 1.Data_preprocessing/
+                  1.9.build_plane_targets.py), predicted from the global
+                  feature with loss weight W. Only training patients' targets
+                  are used; at test time the model still needs only shape +
+                  inlet curve.
 
 Retrain step (default): per fold, the best epoch is first chosen on 10% of the
 training patients (validation). Then a fresh model is trained on ALL the
@@ -118,6 +124,8 @@ _ap.add_argument("--z-is-flow", action="store_true", help="the inlet curve is a 
 _ap.add_argument("--mm", action="store_true",
                  help="geometry in mm and measured inlet velocity from the 4D-flow files "
                       "(Rpt0_N4096_mm.npz, built by 1.Data_preprocessing/1.8.build_mm_dataset.py)")
+_ap.add_argument("--planes", type=float, default=0.0,
+                 help="loss weight of the 4D-flow velocity-plane targets (0 = off)")
 ARGS = _ap.parse_args()
 if ARGS.mm:
     DATA_PATH = "../Data/Sampled/Rpt0_N4096_mm.npz"
@@ -139,6 +147,10 @@ ALIGN = ARGS.align
 PHYSICS = ARGS.physics
 ARCH = ARGS.arch
 PWV_PATH = "../Data/Sampled/pwv_N100.npz"  # from extract_pwv.py
+PLANE_WEIGHT = ARGS.planes
+USE_PLANES = PLANE_WEIGHT > 0
+PLANES_PATH = "../Data/Processed4DFlow/plane_targets.npz"  # from 1.9.build_plane_targets.py
+N_PLANE_OUT = 0  # number of plane targets, set in main() from the file
 
 BATCH_SIZE = 16
 LEARNING_RATE = 1e-4
@@ -178,7 +190,8 @@ RESULTS_DIR = (f"../experiments/14_Final_{ROI_NAME}_{'loo' if CV_LOO else 'cv10'
                + ("" if PHYSICS == "none" else f"_phys-{PHYSICS}")
                + ("_zflow" if ARGS.z_is_flow and PHYSICS != "none" else "")
                + ("_cnn" if ARCH == "cnn" else "")
-               + ("_mm" if ARGS.mm else ""))
+               + ("_mm" if ARGS.mm else "")
+               + (f"_planes{PLANE_WEIGHT:g}" if USE_PLANES else ""))
 
 def best_rotation(A, B):
     """Rotation matrix R (A @ R) taking centred shape A (N, 3) onto centred shape B."""
@@ -310,10 +323,11 @@ class TransformationBlock(nn.Module):
 
 
 class AortaPointNetVelocity(nn.Module):
-    def __init__(self, velocity_dim=VELOCITY_DIM, input_channels=3, use_flow=True, use_pwv=True):
+    def __init__(self, velocity_dim=VELOCITY_DIM, input_channels=3, use_flow=True, use_pwv=True, n_plane=0):
         super().__init__()
         self.use_flow = use_flow
         self.use_pwv = use_pwv
+        self.n_plane = n_plane
         self.input_transform = TransformationBlock(input_channels)
         self.conv64 = ConvBlock(input_channels, 64)
         self.conv128_1 = ConvBlock(64, 128)
@@ -347,6 +361,13 @@ class AortaPointNetVelocity(nn.Module):
                 nn.SiLU(),
                 nn.Linear(128, 1),
             )
+        # --planes: the 4D-flow velocity-plane targets, from the same global feature
+        if n_plane:
+            self.plane_head = nn.Sequential(
+                nn.Linear(2048 + (128 if use_flow else 0), 256),
+                nn.SiLU(),
+                nn.Linear(256, n_plane),
+            )
 
     def forward(self, points, velocity):
         # points: (batch, num_points, input_channels), velocity: (batch, velocity_dim)
@@ -375,7 +396,8 @@ class AortaPointNetVelocity(nn.Module):
         s = self.seg_conv32(s)
         out = self.pred_act(self.pred_head(s))  # (batch, 1, num_points)
         pwv = self.pwv_head(global_combined).squeeze(-1) if self.use_pwv else None  # (batch,)
-        return out.squeeze(1), matrix1, matrix2, pwv  # (batch, num_points), ..., (batch,)
+        planes = self.plane_head(global_combined) if self.n_plane else None         # (batch, n_plane)
+        return out.squeeze(1), matrix1, matrix2, pwv, planes  # (batch, num_points), ..., (batch,), ...
 
 
 # ---------------------------------------------------------------------------
@@ -419,9 +441,10 @@ class WallMapUNet(nn.Module):
     """
     COORD_SCALE = 100.0   # coordinates are in the hundreds; bring them to O(1)
 
-    def __init__(self, velocity_dim=VELOCITY_DIM, input_channels=3, use_flow=True, use_pwv=True, width=32):
+    def __init__(self, velocity_dim=VELOCITY_DIM, input_channels=3, use_flow=True, use_pwv=True, n_plane=0,
+                 width=32):
         super().__init__()
-        self.use_flow, self.use_pwv = use_flow, use_pwv
+        self.use_flow, self.use_pwv, self.n_plane = use_flow, use_pwv, n_plane
         c1, c2, c3, c4 = width, 2 * width, 4 * width, 8 * width
         self.enc1, self.enc2 = RingBlock(input_channels, c1), RingBlock(c1, c2)
         self.enc3, self.enc4 = RingBlock(c2, c3), RingBlock(c3, c4)
@@ -436,6 +459,8 @@ class WallMapUNet(nn.Module):
         self.pred_act = nn.SiLU()
         if use_pwv:
             self.pwv_head = nn.Sequential(nn.Linear(c4 + flow_dim, 128), nn.SiLU(), nn.Linear(128, 1))
+        if n_plane:
+            self.plane_head = nn.Sequential(nn.Linear(c4 + flow_dim, 256), nn.SiLU(), nn.Linear(256, n_plane))
 
     @staticmethod
     def up(x, like):
@@ -459,15 +484,17 @@ class WallMapUNet(nn.Module):
         d1 = self.dec1(torch.cat([self.up(d2, e1), e1], dim=1))
         out = self.pred_act(self.head(d1)).reshape(b, -1)        # back to point order c * 128 + a
         pwv = self.pwv_head(g).squeeze(-1) if self.use_pwv else None
+        planes = self.plane_head(g) if self.n_plane else None
         eye3 = torch.eye(3, device=out.device).expand(b, 3, 3)
         eye128 = torch.eye(128, device=out.device).expand(b, 128, 128)
-        return out, eye3, eye128, pwv
+        return out, eye3, eye128, pwv, planes
 
 
 def build_model(input_channels):
     if ARCH == "cnn":
-        return WallMapUNet(input_channels=input_channels, use_flow=USE_FLOW, use_pwv=USE_PWV)
-    return AortaPointNetVelocity(input_channels=input_channels, use_flow=USE_FLOW, use_pwv=USE_PWV)
+        return WallMapUNet(input_channels=input_channels, use_flow=USE_FLOW, use_pwv=USE_PWV, n_plane=N_PLANE_OUT)
+    return AortaPointNetVelocity(input_channels=input_channels, use_flow=USE_FLOW, use_pwv=USE_PWV,
+                                 n_plane=N_PLANE_OUT)
 
 
 def compute_ssim(pred, target, data_range=1.0, window_size=3):
@@ -574,8 +601,14 @@ def pwv_loss(pwv_pred, pwv_true):
     return PWV_WEIGHT * torch.mean(torch.abs(pwv_pred - pwv_true))
 
 
+def plane_loss(plane_pred, plane_true):
+    """MSE on the standardised plane targets; missing ones (NaN) are left out."""
+    ok = torch.isfinite(plane_true)
+    return PLANE_WEIGHT * torch.mean((plane_pred[ok] - plane_true[ok]) ** 2)
+
+
 def train_one_fold(X_train, Y_train, Z_train, X_val, Y_val, Z_val, X_test, Z_test, device, fold_idx,
-                   input_channels=3, P_train=None, P_val=None):
+                   input_channels=3, P_train=None, P_val=None, Q_train=None, Q_val=None):
     model = build_model(input_channels).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-5)
     roi_slice = ROI_LONGITUDINAL_SLICE if USE_ROI_LOSS else None
@@ -590,6 +623,8 @@ def train_one_fold(X_train, Y_train, Z_train, X_val, Y_val, Z_val, X_test, Z_tes
     Z_test_t = torch.tensor(Z_test, dtype=torch.float32, device=device)
     P_train_t = torch.tensor(P_train, dtype=torch.float32, device=device) if USE_PWV else None
     P_val_t = torch.tensor(P_val, dtype=torch.float32, device=device) if USE_PWV else None
+    Q_train_t = torch.tensor(Q_train, dtype=torch.float32, device=device) if USE_PLANES else None
+    Q_val_t = torch.tensor(Q_val, dtype=torch.float32, device=device) if USE_PLANES else None
 
     # Verify everything is on GPU
     if device.type == 'cuda':
@@ -630,10 +665,12 @@ def train_one_fold(X_train, Y_train, Z_train, X_val, Y_val, Z_val, X_test, Z_tes
         for start in range(0, n_train, BATCH_SIZE):
             idx = perm[start:start + BATCH_SIZE]
             optimizer.zero_grad()
-            pred, m1, m2, pwv = model(X_train_t[idx], Z_train_t[idx])
+            pred, m1, m2, pwv, planes = model(X_train_t[idx], Z_train_t[idx])
             loss = compute_loss(pred, Y_train_t[idx], m1, m2, roi_slice=roi_slice)
             if USE_PWV:
                 loss = loss + pwv_loss(pwv, P_train_t[idx])
+            if USE_PLANES:
+                loss = loss + plane_loss(planes, Q_train_t[idx])
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP_NORM)
             optimizer.step()
@@ -644,10 +681,12 @@ def train_one_fold(X_train, Y_train, Z_train, X_val, Y_val, Z_val, X_test, Z_tes
         model.eval()
         with torch.no_grad():
             # Epoch selection on the validation patients, never on the test fold
-            val_pred, vm1, vm2, val_pwv = model(X_val_t, Z_val_t)
+            val_pred, vm1, vm2, val_pwv, val_planes = model(X_val_t, Z_val_t)
             val_loss = compute_loss(val_pred, Y_val_t, vm1, vm2, roi_slice=roi_slice)
             if USE_PWV:
                 val_loss = val_loss + pwv_loss(val_pwv, P_val_t)
+            if USE_PLANES:
+                val_loss = val_loss + plane_loss(val_planes, Q_val_t)
             val_loss = float(val_loss)
 
         if val_loss < best_val_loss:
@@ -685,7 +724,7 @@ def train_one_fold(X_train, Y_train, Z_train, X_val, Y_val, Z_val, X_test, Z_tes
     model.load_state_dict(best_state)
     model.eval()
     with torch.no_grad():
-        final_pred, _, _, final_pwv = model(X_test_t, Z_test_t)
+        final_pred, _, _, final_pwv, final_planes = model(X_test_t, Z_test_t)
 
     # Fold finished cleanly — the mid-fold resume checkpoint is now superseded by
     # fold_results_path()/fold_model_path() (saved by the caller), so drop it.
@@ -693,11 +732,12 @@ def train_one_fold(X_train, Y_train, Z_train, X_val, Y_val, Z_val, X_test, Z_tes
         os.remove(resume_path)
 
     final_pwv = final_pwv.cpu().numpy() if final_pwv is not None else None
-    return final_pred.cpu().numpy(), final_pwv, best_val_loss, best_state, best_epoch
+    final_planes = final_planes.cpu().numpy() if final_planes is not None else None
+    return final_pred.cpu().numpy(), final_pwv, final_planes, best_val_loss, best_state, best_epoch
 
 
 def retrain_fixed_epochs(X_all, Y_all, Z_all, P_all, n_epochs, X_test, Z_test, device, fold_idx,
-                         input_channels=3):
+                         input_channels=3, Q_all=None):
     """
     Train a fresh model on all of the fold's training patients for a fixed number
     of epochs (chosen beforehand on the validation patients), then predict the
@@ -711,6 +751,7 @@ def retrain_fixed_epochs(X_all, Y_all, Z_all, P_all, n_epochs, X_test, Z_test, d
     to = lambda a: torch.tensor(a, dtype=torch.float32, device=device)  # noqa: E731
     X_t, Y_t, Z_t = to(X_all), to(Y_all), to(Z_all)
     P_t = to(P_all) if USE_PWV else None
+    Q_t = to(Q_all) if USE_PLANES else None
     n = X_t.shape[0]
     for epoch in range(n_epochs):
         model.train()
@@ -718,10 +759,12 @@ def retrain_fixed_epochs(X_all, Y_all, Z_all, P_all, n_epochs, X_test, Z_test, d
         for start in range(0, n, BATCH_SIZE):
             idx = perm[start:start + BATCH_SIZE]
             optimizer.zero_grad()
-            pred, m1, m2, pwv = model(X_t[idx], Z_t[idx])
+            pred, m1, m2, pwv, planes = model(X_t[idx], Z_t[idx])
             loss = compute_loss(pred, Y_t[idx], m1, m2, roi_slice=roi_slice)
             if USE_PWV:
                 loss = loss + pwv_loss(pwv, P_t[idx])
+            if USE_PLANES:
+                loss = loss + plane_loss(planes, Q_t[idx])
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP_NORM)
             optimizer.step()
@@ -729,8 +772,9 @@ def retrain_fixed_epochs(X_all, Y_all, Z_all, P_all, n_epochs, X_test, Z_test, d
             logging.info(f"  Fold {fold_idx} retrain epoch {epoch}/{n_epochs}: train_loss={loss.item():.4f}")
     model.eval()
     with torch.no_grad():
-        pred, _, _, pwv = model(to(X_test), to(Z_test))
-    return pred.cpu().numpy(), (pwv.cpu().numpy() if pwv is not None else None), model.state_dict()
+        pred, _, _, pwv, planes = model(to(X_test), to(Z_test))
+    return (pred.cpu().numpy(), (pwv.cpu().numpy() if pwv is not None else None),
+            (planes.cpu().numpy() if planes is not None else None), model.state_dict())
 
 
 # ---------------------------------------------------------------------------
@@ -789,6 +833,19 @@ def main():
         PWV = pwv_file['pwv'].astype(np.float32)  # (100,) m/s
         logging.info(f"PWV: {PWV.shape}, range [{PWV.min():.2f}, {PWV.max():.2f}] m/s, loss weight {PWV_WEIGHT}")
 
+    PLANES = None
+    if USE_PLANES:
+        global N_PLANE_OUT
+        if not os.path.exists(PLANES_PATH):
+            raise SystemExit(f"{PLANES_PATH} not found: run 1.Data_preprocessing/1.9.build_plane_targets.py first.")
+        plane_file = np.load(PLANES_PATH)
+        if not np.array_equal(plane_file['c'].astype(str), data['c'].astype(str)):
+            raise SystemExit(f"Patient order in {PLANES_PATH} does not match {DATA_PATH}.")
+        PLANES = plane_file['targets'].reshape(len(X), -1).astype(np.float32)  # (100, planes x features)
+        N_PLANE_OUT = PLANES.shape[1]
+        logging.info(f"Plane targets: {N_PLANE_OUT} per patient ({np.isnan(PLANES).mean():.1%} missing), "
+                     f"loss weight {PLANE_WEIGHT}")
+
     logging.info(f"X: {X.shape}, Z: {Z.shape}, Y: {Y.shape}")
     logging.info(f"Y range: [{Y.min():.4f}, {Y.max():.4f}]")
 
@@ -800,11 +857,13 @@ def main():
                  f"{', shapes aligned per fold' if ALIGN else ''}"
                  f"{', physics ' + PHYSICS if PHYSICS != 'none' else ''}"
                  f"{', 2D CNN on the wall map' if ARCH == 'cnn' else ''}"
-                 f"{', mm geometry + measured inlet' if ARGS.mm else ''} -> {RESULTS_DIR}")
+                 f"{', mm geometry + measured inlet' if ARGS.mm else ''}"
+                 f"{', velocity-plane targets' if USE_PLANES else ''} -> {RESULTS_DIR}")
     kf = KFold(n_splits=N_FOLDS, shuffle=True, random_state=SEED)
 
     all_true, all_pred = [], []
     all_pwv_true, all_pwv_pred = [], []
+    all_plane_true, all_plane_pred = [], []
     fold_r2s = []
     fold_mses = []
 
@@ -824,6 +883,7 @@ def main():
             pred, true, fold_r2 = cached['pred'], cached['true'], float(cached['r2'])
             pwv_pred = cached['pwv_pred'] if 'pwv_pred' in cached.files else None
             pwv_true = cached['pwv_true'] if 'pwv_true' in cached.files else None
+            plane_pred = cached['plane_pred'] if 'plane_pred' in cached.files else None
         else:
             logging.info(f"\n=== Fold {fold_idx} ===")
             # Validation patients come out of this fold's training patients only
@@ -857,13 +917,20 @@ def main():
                 p_min, p_max = PWV[fit_ix].min(), PWV[fit_ix].max()
                 p_scale = lambda v: (v - p_min) / (p_max - p_min)  # noqa: E731
 
-            pred_scaled, pwv_scaled, best_val_loss, best_state, best_epoch = train_one_fold(
+            # Plane targets standardised per target with the training patients only
+            if USE_PLANES:
+                q_mu, q_sd = np.nanmean(PLANES[fit_ix], axis=0), np.nanstd(PLANES[fit_ix], axis=0) + 1e-6
+                q_scale = lambda v: (v - q_mu) / q_sd  # noqa: E731
+
+            pred_scaled, pwv_scaled, planes_scaled, best_val_loss, best_state, best_epoch = train_one_fold(
                 Xf[fit_ix], scale(T[fit_ix]), z_scale(Z[fit_ix]),
                 Xf[val_ix], scale(T[val_ix]), z_scale(Z[val_ix]),
                 Xf[test_ix], z_scale(Z[test_ix]),
                 device, fold_idx, input_channels=input_channels,
                 P_train=p_scale(PWV[fit_ix]) if USE_PWV else None,
                 P_val=p_scale(PWV[val_ix]) if USE_PWV else None,
+                Q_train=q_scale(PLANES[fit_ix]) if USE_PLANES else None,
+                Q_val=q_scale(PLANES[val_ix]) if USE_PLANES else None,
             )
             if RETRAIN:
                 # Fresh model on all training patients (train + validation) for the
@@ -876,21 +943,27 @@ def main():
                 z_max = float(np.abs(Z[train_ix]).max()) or 1.0
                 if USE_PWV:
                     p_min, p_max = PWV[train_ix].min(), PWV[train_ix].max()
-                pred_scaled, pwv_scaled, best_state = retrain_fixed_epochs(
+                if USE_PLANES:
+                    q_mu, q_sd = np.nanmean(PLANES[train_ix], axis=0), np.nanstd(PLANES[train_ix], axis=0) + 1e-6
+                pred_scaled, pwv_scaled, planes_scaled, best_state = retrain_fixed_epochs(
                     Xf[train_ix], scale(T[train_ix]), z_scale(Z[train_ix]),
                     p_scale(PWV[train_ix]) if USE_PWV else None,
-                    n_epochs, Xf[test_ix], z_scale(Z[test_ix]), device, fold_idx, input_channels=input_channels)
+                    n_epochs, Xf[test_ix], z_scale(Z[test_ix]), device, fold_idx, input_channels=input_channels,
+                    Q_all=q_scale(PLANES[train_ix]) if USE_PLANES else None)
             pred = pred_scaled * (y_max - y_min) + y_min
             if PHYSICS == "ratio":
                 pred = pred * TAU[test_ix]          # back from WSS / tau to WSS
             true = Y[test_ix]
             pwv_pred = pwv_scaled * (p_max - p_min) + p_min if USE_PWV else None
             pwv_true = PWV[test_ix] if USE_PWV else None
+            plane_pred = planes_scaled * q_sd + q_mu if USE_PLANES else None
             fold_r2 = calculate_r2(true.flatten(), pred.flatten())
 
             # Save immediately — if the run gets interrupted later, this fold's work
             # is not lost, and a re-run will skip straight past it.
             extra = dict(pwv_pred=pwv_pred, pwv_true=pwv_true) if USE_PWV else {}
+            if USE_PLANES:
+                extra['plane_pred'] = plane_pred
             np.savez_compressed(results_path, pred=pred, true=true, r2=fold_r2, best_val_loss=best_val_loss,
                                 best_epoch=best_epoch, retrained=RETRAIN, flow_scaled=True, **extra)
             torch.save(best_state, fold_model_path(fold_idx))
@@ -898,7 +971,7 @@ def main():
 
             # Free this fold's models before the next one: with 100 leave-one-out
             # folds, GPU memory that is not handed back promptly adds up.
-            del best_state, pred_scaled, pwv_scaled
+            del best_state, pred_scaled, pwv_scaled, planes_scaled
             gc.collect()
             if device.type == 'cuda':
                 torch.cuda.empty_cache()
@@ -922,6 +995,9 @@ def main():
         if pwv_pred is not None:
             all_pwv_true.append(pwv_true)
             all_pwv_pred.append(pwv_pred)
+        if USE_PLANES and plane_pred is not None:
+            all_plane_true.append(PLANES[test_ix])
+            all_plane_pred.append(plane_pred)
 
     all_true = np.concatenate(all_true, axis=0)
     all_pred = np.concatenate(all_pred, axis=0)
@@ -1009,6 +1085,27 @@ def main():
             f"[{diff.mean() - 1.96 * diff.std():+.2f}, {diff.mean() + 1.96 * diff.std():+.2f}] m/s"
         )
         pwv_out = dict(all_pwv_true=pt, all_pwv_pred=pp)
+
+    if all_plane_true:
+        # How well the extra targets themselves are predicted for held-out patients:
+        # per target, Pearson across patients, then the median over the 36 planes
+        qt, qp = np.concatenate(all_plane_true), np.concatenate(all_plane_pred)
+        names = [str(f) for f in np.load(PLANES_PATH)['features']]
+        qt, qp = qt.reshape(len(qt), -1, len(names)), qp.reshape(len(qp), -1, len(names))
+        lines = []
+        for k, name in enumerate(names):
+            rs = []
+            for j in range(qt.shape[1]):
+                ok = np.isfinite(qt[:, j, k])
+                t_jk, p_jk = qt[ok, j, k], qp[ok, j, k]
+                if ok.sum() > 2:
+                    with np.errstate(invalid="ignore", divide="ignore"):
+                        r = np.corrcoef(t_jk, p_jk)[0, 1]
+                    if np.isfinite(r):
+                        rs.append(r)
+            lines.append(f" {name}: {np.median(rs):.3f}" if rs else f" {name}: n/a (constant)")
+        logging.info("\nVelocity-plane targets, held-out r (median over planes):\n" + "\n".join(lines))
+        pwv_out.update(all_plane_true=qt, all_plane_pred=qp)
 
     np.savez_compressed(
         os.path.join(RESULTS_DIR, "results.npz"),

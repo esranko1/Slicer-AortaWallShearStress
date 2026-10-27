@@ -5,7 +5,7 @@ predictions, build the four-region composite, and score both Pearson metrics.
 A run is named by a spec string  "<model>:<cv>:<flow>[:seed][:tag...]"
 tags (any order): aligned (main.py --align), phys-input / phys-ratio
 (main.py --physics), zflow (--z-is-flow), cnn (main.py --arch cnn),
-mm (main.py --mm)
+mm (main.py --mm), planes<W> e.g. planes0.1 (main.py --planes 0.1)
     model  composite (the four specialists stitched) | whole (single model)
            | hybrid (the pasc specialist on the proximal ascending aorta, the
              whole-vessel model everywhere else; PWV from the whole model)
@@ -39,18 +39,23 @@ BASELINES = ("meanmap", "poiseuille", "flowradius", "shapemodes", "shapemodes-no
 TAGS = ("aligned", "phys-input", "phys-ratio", "zflow", "cnn", "mm")
 
 
+def _is_tag(p):
+    return p in TAGS or p.startswith("planes")
+
+
 def results_path(region, cv, flow, seed, tags=()):
     if region in BASELINES:
         return f"../experiments/15_Baselines_{cv}/{region}/results.npz"
     tags = set(tags)
-    suffix = (f"_seed{seed}" if seed != 2024 else "") + "".join(f"_{t}" for t in TAGS if t in tags)
+    suffix = (f"_seed{seed}" if seed != 2024 else "") + "".join(f"_{t}" for t in TAGS if t in tags) \
+        + "".join(f"_{t}" for t in sorted(tags) if t.startswith("planes"))
     return f"../experiments/14_Final_{region}_{cv}_{flow}{suffix}/results.npz"
 
 
 def parse_spec(spec):
     parts = spec.split(":")
-    tags = tuple(p for p in parts[3:] if p in TAGS)
-    parts = [p for i, p in enumerate(parts) if not (i >= 3 and p in TAGS)]
+    tags = tuple(p for p in parts[3:] if _is_tag(p))
+    parts = [p for i, p in enumerate(parts) if not (i >= 3 and _is_tag(p))]
     if len(parts) not in (3, 4) or parts[0] not in ("composite", "whole", "hybrid") + BASELINES \
             or parts[1] not in ("cv10", "loo") or parts[2] not in ("flow", "noflow"):
         raise SystemExit(f"Bad run spec '{spec}'; expected <composite|whole>:<cv10|loo>:<flow|noflow>[:seed]")
