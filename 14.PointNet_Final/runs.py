@@ -11,6 +11,7 @@ mm (main.py --mm), planes<W> e.g. planes0.1 (main.py --planes 0.1)
              whole-vessel model everywhere else; PWV from the whole model)
            | meanmap | poiseuille | flowradius (baselines.py; cv10 only, flow ignored)
            | shapemodes | shapemodes-noflow (shape_modes.py; cv10 only, flow ignored)
+           | modes-gp | modes-gp-nophys | modes-ridge (wss_modes.py; cv10 or loo, flow ignored)
     cv     cv10 | loo
     flow   flow | noflow
     seed   optional, default 2024
@@ -33,7 +34,8 @@ REGIONS = {
 WHOLE = slice(0, 128)
 
 
-BASELINES = ("meanmap", "poiseuille", "flowradius", "shapemodes", "shapemodes-noflow")
+BASELINES = ("meanmap", "poiseuille", "flowradius", "shapemodes", "shapemodes-noflow",
+             "modes-gp", "modes-gp-nophys", "modes-ridge")
 
 
 TAGS = ("aligned", "phys-input", "phys-ratio", "zflow", "cnn", "mm")

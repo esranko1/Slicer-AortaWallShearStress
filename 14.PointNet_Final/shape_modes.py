@@ -168,7 +168,7 @@ def main():
         np.savez_compressed(os.path.join(out, "results.npz"), all_true=Y, all_pred=pred[v],
                             chosen_k=np.array([c[0] for c in chosen[v]]),
                             chosen_alpha=np.array([c[1] for c in chosen[v]]))
-        print_table(v, grid(Y), grid(pred[v]))
+        print_table(f"{v} (cv{args.folds})", grid(Y), grid(pred[v]))
 
     shape_var = np.mean(shape_var, axis=0)
     print("\nSensitivity: test-fold scores for each fixed number of shape modes k (alpha still from inner CV).")

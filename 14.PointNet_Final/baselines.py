@@ -88,7 +88,7 @@ def fit_predict(name, tr, te, Y, r, Q):
 def print_table(name, true, pred):
     rows = [("whole", WHOLE)] + list(REGIONS.items())
     q = lambda v: f"{np.median(v):.3f} [{np.percentile(v, 25):.3f}-{np.percentile(v, 75):.3f}]"  # noqa: E731
-    print(f"\n=== {name} (10-fold CV, N={true.shape[0]} patients) ===")
+    print(f"\n=== {name} (N={true.shape[0]} patients) ===")
     print(f"{'region':8s} {'spatial r':>22s} {'MAE (Pa)':>22s} {'NMAE':>22s} {'pooled rho':>11s} "
           f"{'level r':>8s} {'BA bias':>8s}")
     for rname, col in rows:
