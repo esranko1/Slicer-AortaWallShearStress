@@ -115,7 +115,12 @@ _ap.add_argument("--arch", choices=["pointnet", "cnn"], default="pointnet", help
 _ap.add_argument("--physics", choices=["none", "input", "ratio"], default="none",
                  help="Poiseuille as an extra input, or predict WSS / Poiseuille")
 _ap.add_argument("--z-is-flow", action="store_true", help="the inlet curve is a flow rate, not a velocity")
+_ap.add_argument("--mm", action="store_true",
+                 help="geometry in mm and measured inlet velocity from the 4D-flow files "
+                      "(Rpt0_N4096_mm.npz, built by 1.Data_preprocessing/1.8.build_mm_dataset.py)")
 ARGS = _ap.parse_args()
+if ARGS.mm:
+    DATA_PATH = "../Data/Sampled/Rpt0_N4096_mm.npz"
 
 if QUICK_TEST:
     N_FOLDS = 3
@@ -172,7 +177,8 @@ RESULTS_DIR = (f"../experiments/14_Final_{ROI_NAME}_{'loo' if CV_LOO else 'cv10'
                + ("_aligned" if ALIGN else "")
                + ("" if PHYSICS == "none" else f"_phys-{PHYSICS}")
                + ("_zflow" if ARGS.z_is_flow and PHYSICS != "none" else "")
-               + ("_cnn" if ARCH == "cnn" else ""))
+               + ("_cnn" if ARCH == "cnn" else "")
+               + ("_mm" if ARGS.mm else ""))
 
 def best_rotation(A, B):
     """Rotation matrix R (A @ R) taking centred shape A (N, 3) onto centred shape B."""
@@ -793,7 +799,8 @@ def main():
                  f"{'with' if USE_FLOW else 'WITHOUT'} inlet flow input, seed {SEED}"
                  f"{', shapes aligned per fold' if ALIGN else ''}"
                  f"{', physics ' + PHYSICS if PHYSICS != 'none' else ''}"
-                 f"{', 2D CNN on the wall map' if ARCH == 'cnn' else ''} -> {RESULTS_DIR}")
+                 f"{', 2D CNN on the wall map' if ARCH == 'cnn' else ''}"
+                 f"{', mm geometry + measured inlet' if ARGS.mm else ''} -> {RESULTS_DIR}")
     kf = KFold(n_splits=N_FOLDS, shuffle=True, random_state=SEED)
 
     all_true, all_pred = [], []

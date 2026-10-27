@@ -4,7 +4,8 @@ predictions, build the four-region composite, and score both Pearson metrics.
 
 A run is named by a spec string  "<model>:<cv>:<flow>[:seed][:tag...]"
 tags (any order): aligned (main.py --align), phys-input / phys-ratio
-(main.py --physics), zflow (--z-is-flow), cnn (main.py --arch cnn)
+(main.py --physics), zflow (--z-is-flow), cnn (main.py --arch cnn),
+mm (main.py --mm)
     model  composite (the four specialists stitched) | whole (single model)
            | hybrid (the pasc specialist on the proximal ascending aorta, the
              whole-vessel model everywhere else; PWV from the whole model)
@@ -35,7 +36,7 @@ WHOLE = slice(0, 128)
 BASELINES = ("meanmap", "poiseuille", "flowradius", "shapemodes", "shapemodes-noflow")
 
 
-TAGS = ("aligned", "phys-input", "phys-ratio", "zflow", "cnn")
+TAGS = ("aligned", "phys-input", "phys-ratio", "zflow", "cnn", "mm")
 
 
 def results_path(region, cv, flow, seed, tags=()):
