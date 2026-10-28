@@ -4,7 +4,7 @@ predictions, build the four-region composite, and score both Pearson metrics.
 
 A run is named by a spec string  "<model>:<cv>:<flow>[:seed][:tag...]"
 tags (any order): aligned (main.py --align), phys-input / phys-ratio
-(main.py --physics), zflow (--z-is-flow), cnn (main.py --arch cnn),
+(main.py --physics), zflow (--z-is-flow), cnn / dgcnn (main.py --arch),
 mm (main.py --mm), planes<W> e.g. planes0.1 (main.py --planes 0.1)
     model  composite (the four specialists stitched) | whole (single model)
            | hybrid (the pasc specialist on the proximal ascending aorta, the
@@ -38,7 +38,7 @@ BASELINES = ("meanmap", "poiseuille", "flowradius", "shapemodes", "shapemodes-no
              "modes-gp", "modes-gp-nophys", "modes-ridge")
 
 
-TAGS = ("aligned", "phys-input", "phys-ratio", "zflow", "cnn", "mm")
+TAGS = ("aligned", "phys-input", "phys-ratio", "zflow", "cnn", "dgcnn", "mm")
 
 
 def _is_tag(p):

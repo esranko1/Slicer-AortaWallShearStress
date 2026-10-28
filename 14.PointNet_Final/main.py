@@ -26,6 +26,11 @@ untouched.
                   cnn: a small 2D U-Net on the unwrapped 32 x 128 wall map
                   (around x along the vessel), with convolutions that wrap
                   around the ring; same inputs, outputs and protocol.
+                  dgcnn: a dynamic graph network (DGCNN, EdgeConv): every point
+                  learns from its k nearest neighbours, in space in the first
+                  layer and in the learned feature space after that, so it can
+                  link similar points far apart on the wall; same inputs,
+                  outputs and protocol.
     --align       rotate every shape onto a template built from the fold's
                   training patients (rotation only, Procrustes using the point
                   correspondence), so all aortas share one orientation
@@ -117,7 +122,7 @@ _ap.add_argument("--seed", type=int, default=2024)
 _ap.add_argument("--pwv-weight", type=float, default=1.0, help="PWV loss weight; 0 = no PWV output")
 _ap.add_argument("--no-retrain", action="store_true", help="skip retraining on all training patients")
 _ap.add_argument("--align", action="store_true", help="rotate shapes onto a per-fold training template")
-_ap.add_argument("--arch", choices=["pointnet", "cnn"], default="pointnet", help="network type")
+_ap.add_argument("--arch", choices=["pointnet", "cnn", "dgcnn"], default="pointnet", help="network type")
 _ap.add_argument("--physics", choices=["none", "input", "ratio"], default="none",
                  help="Poiseuille as an extra input, or predict WSS / Poiseuille")
 _ap.add_argument("--z-is-flow", action="store_true", help="the inlet curve is a flow rate, not a velocity")
@@ -189,7 +194,7 @@ RESULTS_DIR = (f"../experiments/14_Final_{ROI_NAME}_{'loo' if CV_LOO else 'cv10'
                + ("_aligned" if ALIGN else "")
                + ("" if PHYSICS == "none" else f"_phys-{PHYSICS}")
                + ("_zflow" if ARGS.z_is_flow and PHYSICS != "none" else "")
-               + ("_cnn" if ARCH == "cnn" else "")
+               + ("" if ARCH == "pointnet" else f"_{ARCH}")
                + ("_mm" if ARGS.mm else "")
                + (f"_planes{PLANE_WEIGHT:g}" if USE_PLANES else ""))
 
@@ -490,7 +495,98 @@ class WallMapUNet(nn.Module):
         return out, eye3, eye128, pwv, planes
 
 
+@torch.no_grad()
+def knn(x, k):
+    """(b, c, n) -> indices (b, n, k) of each point's k nearest points in x (itself included)."""
+    sq = (x ** 2).sum(dim=1)                                          # (b, n)
+    neg_dist = 2 * torch.bmm(x.transpose(1, 2), x) - sq[:, :, None] - sq[:, None, :]
+    return neg_dist.topk(k, dim=-1)[1]
+
+
+def edge_features(x, idx):
+    """(b, c, n), neighbour indices (b, n, k) -> (b, 2c, n, k): [neighbour - point, point]."""
+    b, c, n = x.shape
+    k = idx.shape[-1]
+    xt = x.transpose(1, 2).contiguous()                               # (b, n, c)
+    flat = (idx + torch.arange(b, device=x.device).view(-1, 1, 1) * n).reshape(-1)
+    nb = xt.reshape(b * n, c)[flat].view(b, n, k, c)
+    centre = xt.unsqueeze(2).expand(-1, -1, k, -1)
+    return torch.cat([nb - centre, centre], dim=3).permute(0, 3, 1, 2).contiguous()
+
+
+def pointwise(cin, cout, groups=8):
+    return nn.Sequential(nn.Conv1d(cin, cout, 1, bias=False), nn.GroupNorm(groups, cout), nn.SiLU())
+
+
+class EdgeConv(nn.Module):
+    """Shared MLP on each (point, neighbour) edge, then max over the k neighbours."""
+    def __init__(self, cin, cout, k, groups=8):
+        super().__init__()
+        self.k = k
+        self.net = nn.Sequential(nn.Conv2d(2 * cin, cout, 1, bias=False), nn.GroupNorm(groups, cout), nn.SiLU())
+
+    def forward(self, x, graph_from=None):
+        idx = knn(x if graph_from is None else graph_from, self.k)
+        return self.net(edge_features(x, idx)).max(dim=-1)[0]         # (b, cout, n)
+
+
+class DGCNN(nn.Module):
+    """
+    Dynamic graph CNN (Wang et al. 2019, segmentation version). Three EdgeConv
+    layers (64, 64, 128 channels, k = 20 neighbours): the first graph is built
+    from the 3D coordinates, the next two from the learned features (rebuilt
+    every layer). Their outputs are concatenated, embedded to 512 channels and
+    max-pooled to a global feature, which is joined with the inlet-flow
+    embedding, broadcast back to every point and decoded to one WSS value per
+    point. PWV / plane targets come from the global feature. Same call
+    signature and outputs as AortaPointNetVelocity.
+    """
+    COORD_SCALE = 100.0   # as WallMapUNet: coordinates to O(1) for the distance graph
+    K = 20
+
+    def __init__(self, velocity_dim=VELOCITY_DIM, input_channels=3, use_flow=True, use_pwv=True, n_plane=0):
+        super().__init__()
+        self.use_flow, self.use_pwv, self.n_plane = use_flow, use_pwv, n_plane
+        self.ec1 = EdgeConv(input_channels, 64, self.K)
+        self.ec2 = EdgeConv(64, 64, self.K)
+        self.ec3 = EdgeConv(64, 128, self.K)
+        self.embed = pointwise(256, 512)
+        flow_dim = 128 if use_flow else 0
+        if use_flow:
+            self.velocity_encoder = nn.Sequential(nn.Linear(velocity_dim, 64), nn.SiLU(),
+                                                  nn.Linear(64, 128), nn.SiLU())
+        g_dim = 512 + flow_dim
+        self.decoder = nn.Sequential(pointwise(256 + g_dim, 256), pointwise(256, 128), pointwise(128, 64))
+        self.pred_head = nn.Conv1d(64, 1, kernel_size=1)
+        self.pred_act = nn.SiLU()
+        if use_pwv:
+            self.pwv_head = nn.Sequential(nn.Linear(g_dim, 128), nn.SiLU(), nn.Linear(128, 1))
+        if n_plane:
+            self.plane_head = nn.Sequential(nn.Linear(g_dim, 256), nn.SiLU(), nn.Linear(256, n_plane))
+
+    def forward(self, points, velocity):
+        b, n = points.shape[:2]
+        x = points.transpose(1, 2)
+        x = torch.cat([x[:, :3] / self.COORD_SCALE, x[:, 3:]], dim=1)   # (b, C, n)
+        f1 = self.ec1(x, graph_from=x[:, :3])                            # spatial neighbours
+        f2 = self.ec2(f1)                                                # feature-space neighbours
+        f3 = self.ec3(f2)
+        local = torch.cat([f1, f2, f3], dim=1)                           # (b, 256, n)
+        g = self.embed(local).max(dim=2)[0]                              # (b, 512)
+        if self.use_flow:
+            g = torch.cat([g, self.velocity_encoder(velocity)], dim=1)
+        s = self.decoder(torch.cat([local, g.unsqueeze(2).expand(-1, -1, n)], dim=1))
+        out = self.pred_act(self.pred_head(s)).squeeze(1)                # (b, n)
+        pwv = self.pwv_head(g).squeeze(-1) if self.use_pwv else None
+        planes = self.plane_head(g) if self.n_plane else None
+        eye3 = torch.eye(3, device=out.device).expand(b, 3, 3)
+        eye128 = torch.eye(128, device=out.device).expand(b, 128, 128)
+        return out, eye3, eye128, pwv, planes
+
+
 def build_model(input_channels):
+    if ARCH == "dgcnn":
+        return DGCNN(input_channels=input_channels, use_flow=USE_FLOW, use_pwv=USE_PWV, n_plane=N_PLANE_OUT)
     if ARCH == "cnn":
         return WallMapUNet(input_channels=input_channels, use_flow=USE_FLOW, use_pwv=USE_PWV, n_plane=N_PLANE_OUT)
     return AortaPointNetVelocity(input_channels=input_channels, use_flow=USE_FLOW, use_pwv=USE_PWV,
@@ -607,6 +703,14 @@ def plane_loss(plane_pred, plane_true):
     return PLANE_WEIGHT * torch.mean((plane_pred[ok] - plane_true[ok]) ** 2)
 
 
+def predict_in_chunks(model, X_t, Z_t, chunk=BATCH_SIZE):
+    """Model outputs for many patients, BATCH_SIZE at a time (the DGCNN's neighbour
+    search needs memory per patient). Same result as one big batch: GroupNorm
+    normalises each patient on its own."""
+    outs = [model(X_t[i:i + chunk], Z_t[i:i + chunk]) for i in range(0, len(X_t), chunk)]
+    return tuple(None if o[0] is None else torch.cat(o) for o in zip(*outs))
+
+
 def train_one_fold(X_train, Y_train, Z_train, X_val, Y_val, Z_val, X_test, Z_test, device, fold_idx,
                    input_channels=3, P_train=None, P_val=None, Q_train=None, Q_val=None):
     model = build_model(input_channels).to(device)
@@ -681,7 +785,7 @@ def train_one_fold(X_train, Y_train, Z_train, X_val, Y_val, Z_val, X_test, Z_tes
         model.eval()
         with torch.no_grad():
             # Epoch selection on the validation patients, never on the test fold
-            val_pred, vm1, vm2, val_pwv, val_planes = model(X_val_t, Z_val_t)
+            val_pred, vm1, vm2, val_pwv, val_planes = predict_in_chunks(model, X_val_t, Z_val_t)
             val_loss = compute_loss(val_pred, Y_val_t, vm1, vm2, roi_slice=roi_slice)
             if USE_PWV:
                 val_loss = val_loss + pwv_loss(val_pwv, P_val_t)
@@ -724,7 +828,7 @@ def train_one_fold(X_train, Y_train, Z_train, X_val, Y_val, Z_val, X_test, Z_tes
     model.load_state_dict(best_state)
     model.eval()
     with torch.no_grad():
-        final_pred, _, _, final_pwv, final_planes = model(X_test_t, Z_test_t)
+        final_pred, _, _, final_pwv, final_planes = predict_in_chunks(model, X_test_t, Z_test_t)
 
     # Fold finished cleanly — the mid-fold resume checkpoint is now superseded by
     # fold_results_path()/fold_model_path() (saved by the caller), so drop it.
@@ -772,7 +876,7 @@ def retrain_fixed_epochs(X_all, Y_all, Z_all, P_all, n_epochs, X_test, Z_test, d
             logging.info(f"  Fold {fold_idx} retrain epoch {epoch}/{n_epochs}: train_loss={loss.item():.4f}")
     model.eval()
     with torch.no_grad():
-        pred, _, _, pwv, planes = model(to(X_test), to(Z_test))
+        pred, _, _, pwv, planes = predict_in_chunks(model, to(X_test), to(Z_test))
     return (pred.cpu().numpy(), (pwv.cpu().numpy() if pwv is not None else None),
             (planes.cpu().numpy() if planes is not None else None), model.state_dict())
 
@@ -857,6 +961,7 @@ def main():
                  f"{', shapes aligned per fold' if ALIGN else ''}"
                  f"{', physics ' + PHYSICS if PHYSICS != 'none' else ''}"
                  f"{', 2D CNN on the wall map' if ARCH == 'cnn' else ''}"
+                 f"{', dynamic graph network (DGCNN)' if ARCH == 'dgcnn' else ''}"
                  f"{', mm geometry + measured inlet' if ARGS.mm else ''}"
                  f"{', velocity-plane targets' if USE_PLANES else ''} -> {RESULTS_DIR}")
     kf = KFold(n_splits=N_FOLDS, shuffle=True, random_state=SEED)
