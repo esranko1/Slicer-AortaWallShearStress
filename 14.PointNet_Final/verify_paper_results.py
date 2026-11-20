@@ -82,10 +82,20 @@ def load(path):
     return true, pred, pwv
 
 
-def match_rows(true, ref_true):
-    """Index of each reference patient in this run, by identical measured WSS map."""
-    key = {np.round(row, 6).tobytes(): i for i, row in enumerate(true)}
-    return np.array([key.get(np.round(row, 6).tobytes(), -1) for row in ref_true])
+def match_rows(true, ref_true, tol=1e-4):
+    """Index of each reference patient in this run: the row whose measured WSS map equals it
+    (largest difference at any wall point <= tol Pa; files store float32 or float64, so not
+    bit-identical). -1 if none, or if two reference patients would match the same row."""
+    t, r = true.astype(np.float64), ref_true.astype(np.float64)
+    idx = []
+    for row in r:
+        d = np.abs(t - row).max(axis=1)
+        j = int(np.argmin(d))
+        idx.append(j if d[j] <= tol else -1)
+    idx = np.array(idx)
+    if len(set(idx[idx >= 0])) < (idx >= 0).sum():
+        idx[:] = -1
+    return idx
 
 
 def medians(maps, lo, hi):
@@ -103,7 +113,7 @@ def main():
         if not check(os.path.exists(path), label, path):
             continue
         true, pred, pwv = load(path)
-        n_unique = len({np.round(r, 6).tobytes() for r in true})
+        n_unique = len({np.round(r.astype(np.float64), 6).tobytes() for r in true})
         check(true.shape[0] == N_PATIENTS and n_unique == N_PATIENTS,
               f"{label}: {N_PATIENTS} patients, each once", f"{true.shape[0]} rows, {n_unique} distinct")
         check(np.isfinite(true).all() and np.isfinite(pred).all(), f"{label}: no NaN / inf")
@@ -159,7 +169,10 @@ def main():
             diffs = [abs(a - b) for a, b in zip(vals, table[label]) if not (np.isnan(a) and np.isnan(b))]
             same_nan = all(np.isnan(a) == np.isnan(b) for a, b in zip(vals, table[label]))
             ok = same_nan and all(d <= t for d, t in zip(diffs, tol))
-            check(ok, label, "max difference {:.4f}".format(max(diffs)) if diffs else "all undefined")
+            lvl = [abs(a - b) for a, b in zip(vals[:len(REGIONS)], table[label][:len(REGIONS)])
+                   if not (np.isnan(a) or np.isnan(b))]
+            check(ok, label, f"level r: largest difference {max(lvl):.4f} (table has 3 decimals); "
+                  "PWV MAE has 2 decimals" if lvl else "level r undefined (as intended)")
     else:
         check(False, "table found", f"{args.table} missing: run python figures.py --paper first")
 
