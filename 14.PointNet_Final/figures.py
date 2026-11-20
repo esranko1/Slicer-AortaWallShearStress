@@ -5,6 +5,7 @@ results only (no training; about a minute on CPU).
     python figures.py                                  # all methods in METHODS that have results
     python figures.py --only "Final (LOO)" "2D CNN"    # a subset, by label
     python figures.py --bins 10                        # Dice of the top / bottom 10% instead of 25%
+    python figures.py --paper                          # only the methods in the paper (PAPER), to ../experiments/figures_paper
 
 Writes to ../experiments/figures/ (PNG at 300 dpi + PDF):
   box_spatial_r     per-patient spatial r (Pearson across the region's wall
@@ -48,6 +49,9 @@ from runs import (REGIONS, WHOLE, level_bland_altman, level_values, load_run, ma
                   pooled_spearman, r_spatial_per_patient, region_points)
 
 FINAL = "whole:cv10:flow:aligned:phys-input"
+FINAL_MODEL = "Final model: PointNet on aligned shapes + inlet velocity + Poiseuille WSS input"
+FINAL_PROTOCOL = {"Final (LOO)": "leave-one-out: each patient predicted by a model trained on the other 99",
+                  "Final (10-fold)": "10-fold cross-validation: each patient predicted by a model trained on the other 90"}
 # (group, label, run spec), in plotting order (top to bottom)
 METHODS = [
     ("Final", "Final (LOO)", "whole:loo:flow:aligned:phys-input"),
@@ -67,6 +71,21 @@ METHODS = [
     ("Target / training", "WSS / Poiseuille", "whole:cv10:flow:aligned:phys-ratio"),
     ("Target / training", "+ velocity planes", FINAL + ":planes0.1"),
     ("Target / training", "Hybrid (asc. specialist)", "hybrid:cv10:flow:aligned:phys-input"),
+]
+# The methods described in the paper (--paper), as (group, label); every other method is supplement only.
+# Comparison figures use Final (10-fold), which has the same folds as the other methods; Final (LOO)
+# appears in Table 2 and the final-model figures.
+PAPER = [
+    ("Final", "Final (LOO)"),
+    ("Final", "Final (10-fold)"),
+    ("Baseline", "Average map"),
+    ("Baseline", "Poiseuille only"),
+    ("Statistical model", "Shape modes + ridge"),
+    ("Statistical model", "WSS modes + GP"),
+    ("Neural network", "PointNet (basic)"),
+    ("Neural network", "2D CNN"),
+    ("Neural network", "DGCNN"),
+    ("Ablation", "Geometry only (no flow)"),
 ]
 REGION_ROWS = [("whole", "Whole aorta", WHOLE), ("pasc", "Prox. ascending", REGIONS["pasc"]),
                ("arch", "Arch", REGIONS["arch"]), ("desc", "Descending", REGIONS["desc"]),
@@ -173,8 +192,10 @@ def ba_panel(ax, r, key, lim):
     ax.set_ylim(*lim[key][1])
 
 
-def bland_altman(res, out):
-    lim = ba_limits(res)
+def bland_altman(res, out, grid=None):
+    """Per-method figures for res; the all-methods grid for grid (default res)."""
+    grid = res if grid is None else grid
+    lim = ba_limits(grid)
     for r in res:                                             # own axes: shared ones squash the better methods
         fig, axes = plt.subplots(1, len(REGION_ROWS), figsize=(13, 2.6), gridspec_kw={"wspace": 0.45})
         for ax, (key, title, _) in zip(axes, REGION_ROWS):
@@ -183,16 +204,17 @@ def bland_altman(res, out):
         axes[0].set_ylabel("predicted - true (Pa)")
         fig.supxlabel("mean of true and predicted median WSS (Pa); blue = bias, dashed = 95% limits of agreement",
                       fontsize=8, color=INK, y=-0.08)
-        fig.suptitle(r[1], x=0.01, ha="left", color=INK, fontsize=9)
+        title = f"{FINAL_MODEL}\n{FINAL_PROTOCOL[r[1]]}" if r[1] in FINAL_PROTOCOL else r[1]
+        fig.suptitle(title, x=0.01, ha="left", color=INK, fontsize=9, y=1.14 if r[1] in FINAL_PROTOCOL else 1.02)
         save(fig, out, f"ba_{slug(r[1])}")
-    fig, axes = plt.subplots(len(res), len(REGION_ROWS), figsize=(13, 2.0 * len(res)), squeeze=False,
+    fig, axes = plt.subplots(len(grid), len(REGION_ROWS), figsize=(13, 2.0 * len(grid)), squeeze=False,
                              gridspec_kw={"wspace": 0.45})
-    for i, r in enumerate(res):
+    for i, r in enumerate(grid):
         for j, (key, title, _) in enumerate(REGION_ROWS):
             ba_panel(axes[i, j], r, key, lim)
             if i == 0:
                 axes[i, j].set_title(title, color=INK)
-            if i == len(res) - 1:
+            if i == len(grid) - 1:
                 axes[i, j].set_xlabel("mean median WSS (Pa)")
         axes[i, 0].set_ylabel(f"{r[1]}\npred - true (Pa)")
     save(fig, out, "ba_grid")
@@ -346,7 +368,7 @@ def forest(res, cmp, out):
         ax.set_axisbelow(True)
     axes[0].set_yticks(range(n), [r[1] for r in rows][::-1])
     axes[0].set_ylim(-0.6, n - 0.4)
-    fig.text(0.01, -0.02, "Dot = difference, line = paired bootstrap 95% CI; filled = CI excludes 0. "
+    fig.text(0.01, -0.07, "Dot = difference, line = paired bootstrap 95% CI; filled = CI excludes 0. "
              "Blue line = no difference from the final model.", fontsize=7, color=NEUTRAL)
     save(fig, out, "forest_vs_final")
 
@@ -354,6 +376,7 @@ def forest(res, cmp, out):
 def final_figures(label, s, run, out):
     """Scatter, PWV and example maps for the final model."""
     true, pred, pwv_true, pwv_pred = run
+    label = f"{FINAL_MODEL}\n{FINAL_PROTOCOL.get(label, label)}"
     # predicted vs true median WSS
     fig, axes = plt.subplots(1, len(REGION_ROWS), figsize=(13, 2.9), gridspec_kw={"wspace": 0.35})
     for ax, (key, title, _) in zip(axes, REGION_ROWS):
@@ -369,7 +392,8 @@ def final_figures(label, s, run, out):
         ax.text(0.04, 0.96, f"r = {s[key]['level_r']:.2f}", transform=ax.transAxes, va="top", color=INK)
         ax.set_xlabel("measured median WSS (Pa)")
     axes[0].set_ylabel("predicted median WSS (Pa)")
-    fig.suptitle(f"{label}: one dot per patient; dashed = identity", x=0.01, ha="left", color=INK, fontsize=9)
+    fig.suptitle(f"{label}\nOne dot per patient; dashed line = identity", x=0.01, ha="left", color=INK, fontsize=9,
+                 y=1.12)
     save(fig, out, "final_scatter")
 
     if pwv_pred is not None:
@@ -395,14 +419,14 @@ def final_figures(label, s, run, out):
                         color=ACCENT if v == bias else NEUTRAL, annotation_clip=False)
         a2.set_xlabel("mean of measured and predicted PWV (m/s)")
         a2.set_ylabel("predicted - measured (m/s)")
-        fig.suptitle(f"{label}: pulse wave velocity", x=0.01, ha="left", color=INK, fontsize=9)
+        fig.suptitle(f"Pulse wave velocity. {label}", x=0.01, ha="left", color=INK, fontsize=9, y=1.08)
         save(fig, out, "final_pwv")
 
     # example maps: patients at the 10th / 50th / 90th percentile of whole-aorta spatial r
     sp = s["whole"]["spatial"]
     order = np.argsort(sp)
     picks = [(q, order[int(round(q / 100 * (len(sp) - 1)))]) for q in (90, 50, 10)]
-    fig, axes = plt.subplots(3, 3, figsize=(13, 5.6), gridspec_kw={"wspace": 0.12, "hspace": 0.55})
+    fig, axes = plt.subplots(3, 3, figsize=(13, 5.6), gridspec_kw={"wspace": 0.16, "hspace": 0.6})
     bounds = [REGIONS[k].stop + 0.5 for k in ("pasc", "arch", "desc")]
     for row, (q, i) in enumerate(picks):
         vmax = np.percentile(np.concatenate([true[i].ravel(), pred[i].ravel()]), 99)
@@ -429,9 +453,9 @@ def final_figures(label, s, run, out):
                 ax.set_xlabel("along the centreline, root to distal")
             cb = fig.colorbar(im, ax=ax, fraction=0.04, pad=0.02)
             cb.ax.tick_params(labelsize=6)
-            cb.set_label("Pa", fontsize=6)
-    fig.suptitle(f"{label}: WSS wall maps (unwrapped; lines = region boundaries)", x=0.01, ha="left",
-                 color=INK, fontsize=9, y=1.0)
+            cb.ax.set_title("Pa", fontsize=6, color=NEUTRAL)
+    fig.suptitle(f"{label}\nWSS wall maps, unwrapped (lines = region boundaries)", x=0.01, ha="left",
+                 color=INK, fontsize=9, y=1.03)
     save(fig, out, "final_maps")
     print("Final-model figures: final_scatter, final_pwv, final_maps "
           f"(patients at the 90th / 50th / 10th percentile of spatial r: rows {[int(i) for _, i in picks]})")
@@ -441,11 +465,18 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--only", nargs="+", help="method labels to include (default: all in METHODS)")
     ap.add_argument("--bins", type=int, default=4, help="Dice area = top / bottom 1/bins of wall points")
-    ap.add_argument("--out", default="../experiments/figures")
+    ap.add_argument("--paper", action="store_true",
+                    help="only the methods in PAPER, grouped as in the paper (default --out ../experiments/figures_paper)")
+    ap.add_argument("--out", default=None, help="output folder (default ../experiments/figures)")
     args = ap.parse_args()
+    args.out = args.out or ("../experiments/figures_paper" if args.paper else "../experiments/figures")
     os.makedirs(args.out, exist_ok=True)
 
-    methods = [m for m in METHODS if not args.only or m[1] in args.only]
+    if args.paper:
+        spec_of = {label: spec for _, label, spec in METHODS}
+        methods = [(g, label, spec_of[label]) for g, label in PAPER]
+    else:
+        methods = [m for m in METHODS if not args.only or m[1] in args.only]
     res, final_run = [], None
     for g, label, spec in methods:
         try:
@@ -461,12 +492,14 @@ def main():
         raise SystemExit("No results found.")
 
     tables(res, args.out, args.bins)
-    boxplots(res, args.out, "spatial", "spatial r (per patient)", "box_spatial_r")
-    boxplots(res, args.out, "dice_high", f"Dice, highest {100 // args.bins}% WSS area", "box_dice_high",
+    # paper: method comparisons on the same 10 folds only (Final (LOO) is in the table and final_* figures)
+    comp = [r for r in res if not (args.paper and r[1] == "Final (LOO)")]
+    boxplots(comp, args.out, "spatial", "spatial r (per patient)", "box_spatial_r")
+    boxplots(comp, args.out, "dice_high", f"Dice, highest {100 // args.bins}% WSS area", "box_dice_high",
              chance=1 / args.bins)
-    boxplots(res, args.out, "dice_low", f"Dice, lowest {100 // args.bins}% WSS area", "box_dice_low",
+    boxplots(comp, args.out, "dice_low", f"Dice, lowest {100 // args.bins}% WSS area", "box_dice_low",
              chance=1 / args.bins)
-    bland_altman(res, args.out)
+    bland_altman(res, args.out, grid=comp)
     cmp = versus_final(res)
     paper_table(res, cmp, args.out)
     forest(res, cmp, args.out)
